@@ -2,7 +2,6 @@ add
 am
 apply
 archive
-bisect
 blame
 branch
 check-ref-format
@@ -34,7 +33,6 @@ merge
 merge-file
 merge-index
 merge-one-file
-multi-pack-index
 name-rev
 notes
 push

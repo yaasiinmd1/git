@@ -61,13 +61,13 @@ test_expect_success 'see if a branch still exists after git ${pack_refs} --prune
 test_expect_success 'see if git ${pack_refs} --prune remove ref files' '
 	git branch f &&
 	git ${pack_refs} --all --prune &&
-	! test -f .git/refs/heads/f
+	test_path_is_missing .git/refs/heads/f
 '
 
 test_expect_success 'see if git ${pack_refs} --prune removes empty dirs' '
 	git branch r/s/t &&
 	git ${pack_refs} --all --prune &&
-	! test -e .git/refs/heads/r
+	test_path_is_missing .git/refs/heads/r
 '
 
 test_expect_success 'git branch g should work when git branch g/h has been deleted' '
@@ -111,43 +111,43 @@ test_expect_success 'test excluded refs are not packed' '
 	git branch dont_pack2 &&
 	git branch pack_this &&
 	git ${pack_refs} --all --exclude "refs/heads/dont_pack*" &&
-	test -f .git/refs/heads/dont_pack1 &&
-	test -f .git/refs/heads/dont_pack2 &&
-	! test -f .git/refs/heads/pack_this'
+	test_path_is_file .git/refs/heads/dont_pack1 &&
+	test_path_is_file .git/refs/heads/dont_pack2 &&
+	test_path_is_missing .git/refs/heads/pack_this'
 
 test_expect_success 'test --no-exclude refs clears excluded refs' '
 	git branch dont_pack3 &&
 	git branch dont_pack4 &&
 	git ${pack_refs} --all --exclude "refs/heads/dont_pack*" --no-exclude &&
-	! test -f .git/refs/heads/dont_pack3 &&
-	! test -f .git/refs/heads/dont_pack4'
+	test_path_is_missing .git/refs/heads/dont_pack3 &&
+	test_path_is_missing .git/refs/heads/dont_pack4'
 
 test_expect_success 'test only included refs are packed' '
 	git branch pack_this1 &&
 	git branch pack_this2 &&
 	git tag dont_pack5 &&
 	git ${pack_refs} --include "refs/heads/pack_this*" &&
-	test -f .git/refs/tags/dont_pack5 &&
-	! test -f .git/refs/heads/pack_this1 &&
-	! test -f .git/refs/heads/pack_this2'
+	test_path_is_file .git/refs/tags/dont_pack5 &&
+	test_path_is_missing .git/refs/heads/pack_this1 &&
+	test_path_is_missing .git/refs/heads/pack_this2'
 
 test_expect_success 'test --no-include refs clears included refs' '
 	git branch pack1 &&
 	git branch pack2 &&
 	git ${pack_refs} --include "refs/heads/pack*" --no-include &&
-	test -f .git/refs/heads/pack1 &&
-	test -f .git/refs/heads/pack2'
+	test_path_is_file .git/refs/heads/pack1 &&
+	test_path_is_file .git/refs/heads/pack2'
 
 test_expect_success 'test --exclude takes precedence over --include' '
 	git branch dont_pack5 &&
 	git ${pack_refs} --include "refs/heads/pack*" --exclude "refs/heads/pack*" &&
-	test -f .git/refs/heads/dont_pack5'
+	test_path_is_file .git/refs/heads/dont_pack5'
 
 test_expect_success 'see if up-to-date packed refs are preserved' '
 	git branch q &&
 	git ${pack_refs} --all --prune &&
 	git update-ref refs/heads/q refs/heads/q &&
-	! test -f .git/refs/heads/q
+	test_path_is_missing .git/refs/heads/q
 '
 
 test_expect_success 'pack, prune and repack' '
@@ -354,8 +354,8 @@ do
 
 			# Create 14 additional references, which brings us to
 			# 15 together with the default branch.
-			printf "create refs/heads/loose-%d HEAD\n" $(test_seq 14) >stdin &&
-			git update-ref --stdin <stdin &&
+			test_seq -f "create refs/heads/loose-%d HEAD" 14 |
+			git update-ref --stdin &&
 			test_path_is_missing .git/packed-refs &&
 			git ${pack_refs} --auto --all &&
 			test_path_is_missing .git/packed-refs &&
@@ -379,8 +379,8 @@ do
 			test_line_count = 2 .git/packed-refs &&
 
 			# Create 15 loose references.
-			printf "create refs/heads/loose-%d HEAD\n" $(test_seq 15) >stdin &&
-			git update-ref --stdin <stdin &&
+			test_seq -f "create refs/heads/loose-%d HEAD" 15 |
+			git update-ref --stdin &&
 			git ${pack_refs} --auto --all &&
 			test_line_count = 2 .git/packed-refs &&
 
@@ -401,18 +401,14 @@ do
 
 			# Create 99 packed refs. This should cause the heuristic
 			# to require more than the minimum amount of loose refs.
-			test_seq 99 |
-			while read i
-			do
-				printf "create refs/heads/packed-%d HEAD\n" $i || return 1
-			done >stdin &&
-			git update-ref --stdin <stdin &&
+			test_seq -f "create refs/heads/packed-%d HEAD" 99 |
+			git update-ref --stdin &&
 			git ${pack_refs} --all &&
 			test_line_count = 101 .git/packed-refs &&
 
 			# Create 24 loose refs, which should not yet cause us to repack.
-			printf "create refs/heads/loose-%d HEAD\n" $(test_seq 24) >stdin &&
-			git update-ref --stdin <stdin &&
+			test_seq -f "create refs/heads/loose-%d HEAD" 24 |
+			git update-ref --stdin &&
 			git ${pack_refs} --auto --all &&
 			test_line_count = 101 .git/packed-refs &&
 
@@ -420,12 +416,42 @@ do
 			# Note that we explicitly do not check for strict
 			# boundaries here, as this also depends on the size of
 			# the object hash.
-			printf "create refs/heads/addn-%d HEAD\n" $(test_seq 10) >stdin &&
-			git update-ref --stdin <stdin &&
+			test_seq -f "create refs/heads/addn-%d HEAD" 10 |
+			git update-ref --stdin &&
 			git ${pack_refs} --auto --all &&
 			test_line_count = 135 .git/packed-refs
 		)
 	'
 done
 
-test_done
+test_expect_success 'pack-refs does not store invalid peeled tag value' '
+	test_when_finished rm -rf repo &&
+	git init repo &&
+	(
+		cd repo &&
+		git commit --allow-empty --message initial &&
+
+		echo garbage >blob-content &&
+		blob_id=$(git hash-object -w -t blob blob-content) &&
+
+		# Write an invalid tag into the object database. The tag itself
+		# is well-formed, but the tagged object is a blob while we
+		# claim that it is a commit.
+		cat >tag-content <<-EOF &&
+		object $blob_id
+		type commit
+		tag bad-tag
+		tagger C O Mitter <committer@example.com> 1112354055 +0200
+
+		annotated
+		EOF
+		tag_id=$(git hash-object -w -t tag tag-content) &&
+		git update-ref refs/tags/bad-tag "$tag_id" &&
+
+		# The packed-refs file should not contain the peeled object ID.
+		# If it did this would cause commands that use the peeled value
+		# to not notice this corrupted tag.
+		git pack-refs --all &&
+		test_grep ! "^\^" .git/packed-refs
+	)
+'

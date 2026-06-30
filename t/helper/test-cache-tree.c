@@ -33,7 +33,7 @@ int cmd__cache_tree(int argc, const char **argv)
 		OPT_END()
 	};
 
-	setup_git_directory();
+	setup_git_directory(the_repository);
 
 	argc = parse_options(argc, argv, NULL, options, test_cache_tree_usage, 0);
 
@@ -41,7 +41,7 @@ int cmd__cache_tree(int argc, const char **argv)
 		die(_("unable to read index file"));
 
 	oidcpy(&oid, &the_repository->index->cache_tree->oid);
-	tree = parse_tree_indirect(&oid);
+	tree = repo_parse_tree_indirect(the_repository, &oid);
 	if (!tree)
 		die(_("not a tree object: %s"), oid_to_hex(&oid));
 

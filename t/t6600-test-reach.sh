@@ -612,6 +612,51 @@ test_expect_success 'for-each-ref merged:none' '
 		--format="%(refname)" --stdin
 '
 
+test_expect_success 'for-each-ref merged:duplicate, all reachable' '
+	git branch dup-a commit-3-3 &&
+	git branch dup-b commit-3-3 &&
+	cat >input <<-\EOF &&
+	refs/heads/commit-1-1
+	refs/heads/dup-a
+	refs/heads/dup-b
+	EOF
+	cat >expect <<-\EOF &&
+	refs/heads/commit-1-1
+	refs/heads/dup-a
+	refs/heads/dup-b
+	EOF
+	run_all_modes git for-each-ref --merged=commit-5-5 \
+		--format="%(refname)" --stdin
+'
+
+test_expect_success 'for-each-ref merged:duplicate, none reachable' '
+	cat >input <<-\EOF &&
+	refs/heads/dup-a
+	refs/heads/dup-b
+	refs/heads/commit-9-9
+	EOF
+	>expect &&
+	run_all_modes git for-each-ref --merged=commit-2-2 \
+		--format="%(refname)" --stdin
+'
+
+test_expect_success 'for-each-ref merged:duplicate at min generation' '
+	git branch dup-c commit-1-1 &&
+	git branch dup-d commit-1-1 &&
+	cat >input <<-\EOF &&
+	refs/heads/dup-c
+	refs/heads/dup-d
+	refs/heads/commit-5-5
+	EOF
+	cat >expect <<-\EOF &&
+	refs/heads/commit-5-5
+	refs/heads/dup-c
+	refs/heads/dup-d
+	EOF
+	run_all_modes git for-each-ref --merged=commit-5-5 \
+		--format="%(refname)" --stdin
+'
+
 # For get_branch_base_for_tip, we only care about
 # first-parent history. Here is the test graph with
 # second parents removed:
@@ -760,6 +805,166 @@ test_expect_success 'for-each-ref is-base: --sort' '
 	run_all_modes git for-each-ref \
 		--format="%(refname)" --stdin \
 		--sort=refname --sort=-is-base:commit-2-3
+'
+
+test_expect_success 'rev-list --maximal-only (all positive)' '
+	# Only one maximal.
+	cat >input <<-\EOF &&
+	refs/heads/commit-1-1
+	refs/heads/commit-4-2
+	refs/heads/commit-4-4
+	refs/heads/commit-8-4
+	EOF
+
+	cat >expect <<-EOF &&
+	$(git rev-parse refs/heads/commit-8-4)
+	EOF
+	run_all_modes git rev-list --maximal-only --stdin &&
+
+	# All maximal.
+	cat >input <<-\EOF &&
+	refs/heads/commit-5-2
+	refs/heads/commit-4-3
+	refs/heads/commit-3-4
+	refs/heads/commit-2-5
+	EOF
+
+	cat >expect <<-EOF &&
+	$(git rev-parse refs/heads/commit-5-2)
+	$(git rev-parse refs/heads/commit-4-3)
+	$(git rev-parse refs/heads/commit-3-4)
+	$(git rev-parse refs/heads/commit-2-5)
+	EOF
+	run_all_modes git rev-list --maximal-only --stdin &&
+
+	# Mix of both.
+	cat >input <<-\EOF &&
+	refs/heads/commit-5-2
+	refs/heads/commit-3-2
+	refs/heads/commit-2-5
+	EOF
+
+	cat >expect <<-EOF &&
+	$(git rev-parse refs/heads/commit-5-2)
+	$(git rev-parse refs/heads/commit-2-5)
+	EOF
+	run_all_modes git rev-list --maximal-only --stdin
+'
+
+test_expect_success 'rev-list --maximal-only (range)' '
+	cat >input <<-\EOF &&
+	refs/heads/commit-1-1
+	refs/heads/commit-2-5
+	refs/heads/commit-6-4
+	^refs/heads/commit-4-5
+	EOF
+
+	cat >expect <<-EOF &&
+	$(git rev-parse refs/heads/commit-6-4)
+	EOF
+	run_all_modes git rev-list --maximal-only --stdin &&
+
+	# first-parent changes reachability: the first parent
+	# reduces the second coordinate to 1 before reducing the
+	# first coordinate.
+	cat >input <<-\EOF &&
+	refs/heads/commit-1-1
+	refs/heads/commit-2-5
+	refs/heads/commit-6-4
+	^refs/heads/commit-4-5
+	EOF
+
+	cat >expect <<-EOF &&
+	$(git rev-parse refs/heads/commit-6-4)
+	$(git rev-parse refs/heads/commit-2-5)
+	EOF
+	run_all_modes git rev-list --maximal-only --stdin \
+		--first-parent --exclude-first-parent-only
+'
+
+test_expect_success 'rev-list --maximal-only matches merge-base --independent' '
+	# Mix of independent and dependent
+	git merge-base --independent \
+		refs/heads/commit-5-2 \
+		refs/heads/commit-3-2 \
+		refs/heads/commit-2-5 >expect &&
+	sort expect >expect.sorted &&
+	git rev-list --maximal-only \
+		refs/heads/commit-5-2 \
+		refs/heads/commit-3-2 \
+		refs/heads/commit-2-5 >actual &&
+	sort actual >actual.sorted &&
+	test_cmp expect.sorted actual.sorted &&
+
+	# All independent commits.
+	git merge-base --independent \
+		refs/heads/commit-5-2 \
+		refs/heads/commit-4-3 \
+		refs/heads/commit-3-4 \
+		refs/heads/commit-2-5 >expect &&
+	sort expect >expect.sorted &&
+	git rev-list --maximal-only \
+		refs/heads/commit-5-2 \
+		refs/heads/commit-4-3 \
+		refs/heads/commit-3-4 \
+		refs/heads/commit-2-5 >actual &&
+	sort actual >actual.sorted &&
+	test_cmp expect.sorted actual.sorted &&
+
+	# Only one independent.
+	git merge-base --independent \
+		refs/heads/commit-1-1 \
+		refs/heads/commit-4-2 \
+		refs/heads/commit-4-4 \
+		refs/heads/commit-8-4 >expect &&
+	sort expect >expect.sorted &&
+	git rev-list --maximal-only \
+		refs/heads/commit-1-1 \
+		refs/heads/commit-4-2 \
+		refs/heads/commit-4-4 \
+		refs/heads/commit-8-4 >actual &&
+	sort actual >actual.sorted &&
+	test_cmp expect.sorted actual.sorted
+'
+
+# The following tests verify the early-exit optimisation in
+# paint_down_to_common when merge-base is invoked without --all.
+# Each test checks all four commit-graph configurations.
+
+merge_base_all_modes () {
+	test_when_finished rm -rf .git/objects/info/commit-graph &&
+	git merge-base "$@" >actual &&
+	test_cmp expect actual &&
+	cp commit-graph-full .git/objects/info/commit-graph &&
+	git merge-base "$@" >actual &&
+	test_cmp expect actual &&
+	cp commit-graph-half .git/objects/info/commit-graph &&
+	git merge-base "$@" >actual &&
+	test_cmp expect actual &&
+	cp commit-graph-no-gdat .git/objects/info/commit-graph &&
+	git merge-base "$@" >actual &&
+	test_cmp expect actual
+}
+
+test_expect_success 'merge-base without --all (unique base)' '
+	git rev-parse commit-5-3 >expect &&
+	merge_base_all_modes commit-5-7 commit-8-3
+'
+
+test_expect_success 'merge-base without --all is one of --all results' '
+	test_when_finished rm -rf .git/objects/info/commit-graph &&
+
+	cp commit-graph-full .git/objects/info/commit-graph &&
+	git merge-base --all commit-5-7 commit-4-8 commit-6-6 commit-8-3 >all &&
+	git merge-base commit-5-7 commit-4-8 commit-6-6 commit-8-3 >single &&
+	test_line_count = 1 single &&
+	grep -F -f single all &&
+
+	cp commit-graph-half .git/objects/info/commit-graph &&
+	git merge-base --all commit-5-7 commit-4-8 commit-6-6 commit-8-3 >all &&
+	git merge-base commit-5-7 commit-4-8 commit-6-6 commit-8-3 >single &&
+	test_line_count = 1 single &&
+	grep -F -f single all
 '
 
 test_done

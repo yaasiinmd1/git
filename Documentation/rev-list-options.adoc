@@ -16,14 +16,18 @@ ordering and formatting options, such as `--reverse`.
 `-<number>`::
 `-n <number>`::
 `--max-count=<number>`::
-	Limit the output to _<number>_ commits.
+	Limit the output to the first _<number>_ commits that would be shown.
+
+`--max-count-oldest=<number>`::
+	Limit the output to the last _<number>_ commits that would be shown.
 
 `--skip=<number>`::
 	Skip _<number>_ commits before starting to show the commit output.
 
 `--since=<date>`::
 `--after=<date>`::
-	Show commits more recent than _<date>_.
+	Show commits more recent than _<date>_.  As a special case,
+	'today' means the last midnight.
 
 `--since-as-filter=<date>`::
 	Show all commits more recent than _<date>_. This visits
@@ -147,6 +151,10 @@ endif::git-log[]
 	This can be used to find the set of changes in a topic branch
 	from the point where it diverged from the remote branch, given
 	that arbitrary merges can be valid topic branch changes.
+
+`--maximal-only`::
+	Restrict the output commits to be those that are not reachable
+	from any other commits in the revision range.
 
 `--not`::
 	Reverses the meaning of the '{caret}' prefix (or lack thereof)
@@ -983,7 +991,9 @@ to name units in KiB, MiB, or GiB.  For example, `blob:limit=1k`
 is the same as 'blob:limit=1024'.
 +
 The form `--filter=object:type=(tag|commit|tree|blob)` omits all objects
-which are not of the requested type.
+which are not of the requested type. Note that explicitly provided objects
+ignore filters and are always printed unless `--filter-provided-objects` is
+also specified.
 +
 The form `--filter=sparse:oid=<blob-ish>` uses a sparse-checkout
 specification contained in the blob (or blob-expression) _<blob-ish>_
@@ -1094,7 +1104,7 @@ endif::git-rev-list[]
 	Overrides a previous `--no-walk`.
 endif::git-shortlog[]
 
-ifndef::git-shortlog[]
+ifndef::git-shortlog,git-replay[]
 Commit Formatting
 ~~~~~~~~~~~~~~~~~
 
@@ -1253,6 +1263,12 @@ This implies the `--topo-order` option by default, but the
 	in between them in that case. If _<barrier>_ is specified, it
 	is the string that will be shown instead of the default one.
 
+`--graph-lane-limit=<n>`::
+	When `--graph` is used, limit the number of graph lanes to be shown.
+	Lanes over the limit are replaced with a truncation mark '~'.
+	By default it is set to 0 (no limit), zero and negative values
+	are ignored and treated as no limit.
+
 ifdef::git-rev-list[]
 `--count`::
 	Print a number stating how many commits would have been
@@ -1263,4 +1279,4 @@ ifdef::git-rev-list[]
 	counts and print the count for equivalent commits separated
 	by a tab.
 endif::git-rev-list[]
-endif::git-shortlog[]
+endif::git-shortlog,git-replay[]

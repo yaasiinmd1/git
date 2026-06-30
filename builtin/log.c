@@ -16,15 +16,17 @@
 #include "refs.h"
 #include "object-name.h"
 #include "odb.h"
+#include "odb/streaming.h"
 #include "pager.h"
 #include "color.h"
 #include "commit.h"
 #include "diff.h"
+#include "diffcore.h"
 #include "diff-merges.h"
 #include "revision.h"
 #include "log-tree.h"
-#include "builtin.h"
 #include "oid-array.h"
+#include "oidset.h"
 #include "tag.h"
 #include "reflog-walk.h"
 #include "patch-ids.h"
@@ -35,16 +37,19 @@
 #include "parse-options.h"
 #include "line-log.h"
 #include "branch.h"
-#include "streaming.h"
 #include "version.h"
 #include "mailmap.h"
 #include "progress.h"
 #include "commit-slab.h"
+#include "advice.h"
+#include "utf8.h"
 
 #include "commit-reach.h"
+#include "promisor-remote.h"
 #include "range-diff.h"
 #include "tmp-objdir.h"
 #include "tree.h"
+#include "userdiff.h"
 #include "write-or-die.h"
 
 #define MAIL_DEFAULT_WRAP 72
@@ -337,7 +342,7 @@ static void cmd_log_init_finish(int argc, const char **argv, const char *prefix,
 	if (mailmap) {
 		rev->mailmap = xmalloc(sizeof(struct string_list));
 		string_list_init_nodup(rev->mailmap);
-		read_mailmap(rev->mailmap);
+		read_mailmap(the_repository, rev->mailmap);
 	}
 
 	if (rev->pretty_given && rev->commit_format == CMIT_FMT_RAW) {
@@ -424,7 +429,7 @@ static int cmd_log_walk_no_free(struct rev_info *rev)
 			 */
 			free_commit_buffer(the_repository->parsed_objects,
 					   commit);
-			free_commit_list(commit->parents);
+			commit_list_free(commit->parents);
 			commit->parents = NULL;
 		}
 		if (saved_nrl < rev->diffopt.needed_rename_limit)
@@ -584,7 +589,7 @@ static int show_blob_object(const struct object_id *oid, struct rev_info *rev, c
 	fflush(rev->diffopt.file);
 	if (!rev->diffopt.flags.textconv_set_via_cmdline ||
 	    !rev->diffopt.flags.allow_textconv)
-		return stream_blob_to_fd(1, oid, NULL, 0);
+		return odb_stream_blob_to_fd(the_repository->objects, 1, oid, NULL, 0);
 
 	if (get_oid_with_context(the_repository, obj_name,
 				 GET_OID_RECORD_PATH,
@@ -594,7 +599,7 @@ static int show_blob_object(const struct object_id *oid, struct rev_info *rev, c
 	    !textconv_object(the_repository, obj_context.path,
 			     obj_context.mode, &oidc, 1, &buf, &size)) {
 		object_context_release(&obj_context);
-		return stream_blob_to_fd(1, oid, NULL, 0);
+		return odb_stream_blob_to_fd(the_repository->objects, 1, oid, NULL, 0);
 	}
 
 	if (!buf)
@@ -608,7 +613,7 @@ static int show_blob_object(const struct object_id *oid, struct rev_info *rev, c
 
 static int show_tag_object(const struct object_id *oid, struct rev_info *rev)
 {
-	unsigned long size;
+	size_t size;
 	enum object_type type;
 	char *buf = odb_read_object(the_repository->objects, oid, &type, &size);
 	unsigned long offset = 0;
@@ -886,6 +891,7 @@ struct format_config {
 	char *signature;
 	char *signature_file;
 	enum cover_setting config_cover_letter;
+	char *fmt_cover_letter_commit_list;
 	char *config_output_directory;
 	enum cover_from_description cover_from_description_mode;
 	int show_notes;
@@ -930,6 +936,7 @@ static void format_config_release(struct format_config *cfg)
 	string_list_clear(&cfg->extra_cc, 0);
 	strbuf_release(&cfg->sprefix);
 	free(cfg->fmt_patch_suffix);
+	free(cfg->fmt_cover_letter_commit_list);
 }
 
 static enum cover_from_description parse_cover_from_description(const char *arg)
@@ -1052,6 +1059,10 @@ static int git_format_config(const char *var, const char *value,
 		cfg->config_cover_letter = git_config_bool(var, value) ? COVER_ON : COVER_OFF;
 		return 0;
 	}
+	if (!strcmp(var, "format.commitlistformat")) {
+		FREE_AND_NULL(cfg->fmt_cover_letter_commit_list);
+		return git_config_string(&cfg->fmt_cover_letter_commit_list, var, value);
+	}
 	if (!strcmp(var, "format.outputdirectory")) {
 		FREE_AND_NULL(cfg->config_output_directory);
 		return git_config_string(&cfg->config_output_directory, var, value);
@@ -1096,7 +1107,18 @@ static int git_format_config(const char *var, const char *value,
 		return 0;
 	}
 	if (!strcmp(var, "format.noprefix")) {
-		format_no_prefix = 1;
+		format_no_prefix = git_parse_maybe_bool(value);
+		if (format_no_prefix < 0) {
+			int status = die_message(
+				_("bad boolean config value '%s' for '%s'"),
+				value, var);
+			advise(_("'%s' used to accept any value and "
+				 "treat that as 'true'.\n"
+				 "Now it only accepts boolean values, "
+				 "like what '%s' does.\n"),
+			       var, "diff.noprefix");
+			exit(status);
+		}
 		return 0;
 	}
 
@@ -1324,15 +1346,56 @@ static void get_notes_args(struct strvec *arg, struct rev_info *rev)
 	}
 }
 
+static void generate_shortlog_cover_letter(struct shortlog *log,
+					   struct rev_info *rev,
+					   struct commit **list,
+					   int nr)
+{
+	shortlog_init(log);
+	log->wrap_lines = 1;
+	log->wrap = MAIL_DEFAULT_WRAP;
+	log->in1 = 2;
+	log->in2 = 4;
+	log->file = rev->diffopt.file;
+	log->groups = SHORTLOG_GROUP_AUTHOR;
+	shortlog_finish_setup(log);
+	for (int i = 0; i < nr; i++)
+		shortlog_add_commit(log, list[i]);
+
+	shortlog_output(log);
+}
+
+static void generate_commit_list_cover(FILE *cover_file, const char *format,
+				       struct commit **list, int n)
+{
+	struct strbuf commit_line = STRBUF_INIT;
+	struct pretty_print_context ctx = {0};
+	struct rev_info rev = REV_INFO_INIT;
+
+	rev.total = n;
+	ctx.rev = &rev;
+	for (int i = 1; i <= n; i++) {
+		rev.nr = i;
+		repo_format_commit_message(the_repository, list[n - i], format,
+				&commit_line, &ctx);
+		fprintf(cover_file, "%s\n", commit_line.buf);
+		strbuf_reset(&commit_line);
+	}
+	fprintf(cover_file, "\n");
+
+	strbuf_release(&commit_line);
+}
+
 static void make_cover_letter(struct rev_info *rev, int use_separate_file,
 			      struct commit *origin,
 			      int nr, struct commit **list,
 			      const char *description_file,
 			      const char *branch_name,
 			      int quiet,
-			      const struct format_config *cfg)
+			      const struct format_config *cfg,
+			      const char *format)
 {
-	const char *committer;
+	const char *from;
 	struct shortlog log;
 	struct strbuf sb = STRBUF_INIT;
 	int i;
@@ -1345,7 +1408,7 @@ static void make_cover_letter(struct rev_info *rev, int use_separate_file,
 	if (!cmit_fmt_is_mail(rev->commit_format))
 		die(_("cover letter needs email format"));
 
-	committer = git_committer_info(0);
+	from = cfg->from ? cfg->from : git_committer_info(0);
 
 	if (use_separate_file &&
 	    open_next_file(NULL, rev->numbered_files ? NULL : "cover-letter", rev, quiet))
@@ -1368,7 +1431,7 @@ static void make_cover_letter(struct rev_info *rev, int use_separate_file,
 	pp.date_mode.type = DATE_RFC2822;
 	pp.rev = rev;
 	pp.encode_email_headers = rev->encode_email_headers;
-	pp_user_info(&pp, NULL, &sb, committer, encoding);
+	pp_user_info(&pp, NULL, &sb, from, encoding);
 	prepare_cover_text(&pp, description_file, branch_name, &sb,
 			   encoding, need_8bit_cte, cfg);
 	fprintf(rev->diffopt.file, "%s\n", sb.buf);
@@ -1377,18 +1440,17 @@ static void make_cover_letter(struct rev_info *rev, int use_separate_file,
 	free(pp.after_subject);
 	strbuf_release(&sb);
 
-	shortlog_init(&log);
-	log.wrap_lines = 1;
-	log.wrap = MAIL_DEFAULT_WRAP;
-	log.in1 = 2;
-	log.in2 = 4;
-	log.file = rev->diffopt.file;
-	log.groups = SHORTLOG_GROUP_AUTHOR;
-	shortlog_finish_setup(&log);
-	for (i = 0; i < nr; i++)
-		shortlog_add_commit(&log, list[i]);
-
-	shortlog_output(&log);
+	if (skip_prefix(format, "log:", &format))
+		generate_commit_list_cover(rev->diffopt.file, format, list, nr);
+	else if (!strcmp(format, "shortlog"))
+		generate_shortlog_cover_letter(&log, rev, list, nr);
+	else if (!strcmp(format, "modern"))
+		generate_commit_list_cover(rev->diffopt.file, "%w(72)[%(count)/%(total)] %s",
+					   list, nr);
+	else if (strchr(format, '%'))
+		generate_commit_list_cover(rev->diffopt.file, format, list, nr);
+	else
+		die(_("'%s' is not a valid format string"), format);
 
 	/* We can only do diffstat with a unique reference point */
 	if (origin)
@@ -1697,12 +1759,12 @@ static struct commit *get_base_commit(const struct format_config *cfg,
 				if (die_on_failure) {
 					die(_("could not find exact merge base"));
 				} else {
-					free_commit_list(base_list);
+					commit_list_free(base_list);
 					return NULL;
 				}
 			}
 			base = base_list->item;
-			free_commit_list(base_list);
+			commit_list_free(base_list);
 		} else {
 			if (die_on_failure)
 				die(_("failed to get upstream, if you want to record base commit automatically,\n"
@@ -1732,14 +1794,14 @@ static struct commit *get_base_commit(const struct format_config *cfg,
 				if (die_on_failure) {
 					die(_("failed to find exact merge base"));
 				} else {
-					free_commit_list(merge_base);
+					commit_list_free(merge_base);
 					free(rev);
 					return NULL;
 				}
 			}
 
 			rev[i] = merge_base->item;
-			free_commit_list(merge_base);
+			commit_list_free(merge_base);
 		}
 
 		if (rev_nr % 2)
@@ -1896,16 +1958,17 @@ int cmd_format_patch(int argc,
 {
 	struct format_config cfg;
 	struct commit *commit;
-	struct commit **list = NULL;
+	struct commit_stack list = COMMIT_STACK_INIT;
 	struct rev_info rev;
 	char *to_free = NULL;
 	struct setup_revision_opt s_r_opt;
-	size_t nr = 0, total, i;
+	size_t total, i;
 	int use_stdout = 0;
 	int start_number = -1;
 	int just_numbers = 0;
 	int ignore_if_in_upstream = 0;
 	int cover_letter = -1;
+	const char *cover_letter_fmt = NULL;
 	int boundary_count = 0;
 	int no_binary_diff = 0;
 	int zero_commit = 0;
@@ -1952,6 +2015,8 @@ int cmd_format_patch(int argc,
 			    N_("print patches to standard out")),
 		OPT_BOOL(0, "cover-letter", &cover_letter,
 			    N_("generate a cover letter")),
+		OPT_STRING(0, "commit-list-format", &cover_letter_fmt, N_("format-spec"),
+			    N_("format spec used for the commit list in the cover letter")),
 		OPT_BOOL(0, "numbered-files", &just_numbers,
 			    N_("use simple number sequence for output file names")),
 		OPT_STRING(0, "suffix", &fmt_patch_suffix, N_("sfx"),
@@ -2283,14 +2348,21 @@ int cmd_format_patch(int argc,
 		if (ignore_if_in_upstream && has_commit_patch_id(commit, &ids))
 			continue;
 
-		nr++;
-		REALLOC_ARRAY(list, nr);
-		list[nr - 1] = commit;
+		commit_stack_push(&list, commit);
 	}
-	if (nr == 0)
+	if (!list.nr)
 		/* nothing to do */
 		goto done;
-	total = nr;
+	total = list.nr;
+
+	if (!cover_letter_fmt) {
+		cover_letter_fmt = cfg.fmt_cover_letter_commit_list;
+		if (!cover_letter_fmt)
+			cover_letter_fmt = "shortlog";
+	} else if (cover_letter == -1) {
+		cover_letter = 1;
+	}
+
 	if (cover_letter == -1) {
 		if (cfg.config_cover_letter == COVER_AUTO)
 			cover_letter = (total > 1);
@@ -2308,7 +2380,7 @@ int cmd_format_patch(int argc,
 		if (!cover_letter && total != 1)
 			die(_("--interdiff requires --cover-letter or single patch"));
 		rev.idiff_oid1 = &idiff_prev.oid[idiff_prev.nr - 1];
-		rev.idiff_oid2 = get_commit_tree_oid(list[0]);
+		rev.idiff_oid2 = get_commit_tree_oid(list.items[0]);
 		rev.idiff_title = diff_title(&idiff_title, reroll_count,
 					     _("Interdiff:"),
 					     _("Interdiff against v%d:"));
@@ -2324,7 +2396,7 @@ int cmd_format_patch(int argc,
 			die(_("--range-diff requires --cover-letter or single patch"));
 
 		infer_range_diff_ranges(&rdiff1, &rdiff2, rdiff_prev,
-					origin, list[0]);
+					origin, list.items[0]);
 		rev.rdiff1 = rdiff1.buf;
 		rev.rdiff2 = rdiff2.buf;
 		rev.creation_factor = creation_factor;
@@ -2360,11 +2432,11 @@ int cmd_format_patch(int argc,
 	}
 
 	memset(&bases, 0, sizeof(bases));
-	base = get_base_commit(&cfg, list, nr);
+	base = get_base_commit(&cfg, list.items, list.nr);
 	if (base) {
 		reset_revision_walk();
 		clear_object_flags(the_repository, UNINTERESTING);
-		prepare_bases(&bases, base, list, nr);
+		prepare_bases(&bases, base, list.items, list.nr);
 	}
 
 	if (in_reply_to || cfg.thread || cover_letter) {
@@ -2377,11 +2449,14 @@ int cmd_format_patch(int argc,
 	}
 	rev.numbered_files = just_numbers;
 	rev.patch_suffix = fmt_patch_suffix;
+
 	if (cover_letter) {
 		if (cfg.thread)
 			gen_message_id(&rev, "cover");
 		make_cover_letter(&rev, !!output_directory,
-				  origin, nr, list, description_file, branch_name, quiet, &cfg);
+				  origin, list.nr, list.items,
+				  description_file, branch_name, quiet, &cfg,
+				  cover_letter_fmt);
 		print_bases(&bases, rev.diffopt.file);
 		print_signature(signature, rev.diffopt.file);
 		total++;
@@ -2395,12 +2470,12 @@ int cmd_format_patch(int argc,
 	if (show_progress)
 		progress = start_delayed_progress(the_repository,
 						  _("Generating patches"), total);
-	for (i = 0; i < nr; i++) {
-		size_t idx = nr - i - 1;
+	while (list.nr) {
+		size_t idx = list.nr - 1;
 		int shown;
 
 		display_progress(progress, total - idx);
-		commit = list[idx];
+		commit = commit_stack_pop(&list);
 		rev.nr = total - idx + (start_number - 1);
 
 		/* Make the second and subsequent mails replies to the first */
@@ -2469,7 +2544,7 @@ int cmd_format_patch(int argc,
 		}
 	}
 	stop_progress(&progress);
-	free(list);
+	commit_stack_clear(&list);
 	if (ignore_if_in_upstream)
 		free_patch_ids(&ids);
 
@@ -2529,6 +2604,131 @@ static void print_commit(char sign, struct commit *commit, int verbose,
 		       buf.buf);
 		strbuf_release(&buf);
 	}
+}
+
+/*
+ * Enumerate blob OIDs from a single commit's diff, inserting them into blobs.
+ * Skips files whose userdiff driver explicitly declares binary status
+ * (drv->binary > 0), since patch-ID uses oid_to_hex() for those and
+ * never reads blob content.  Use userdiff_find_by_path() since
+ * diff_filespec_load_driver() is static in diff.c.
+ *
+ * Clean up with diff_queue_clear() (from diffcore.h).
+ */
+static void collect_diff_blob_oids(struct commit *commit,
+				   struct diff_options *opts,
+				   struct oidset *blobs)
+{
+	struct diff_queue_struct *q;
+
+	/*
+	 * Merge commits are filtered out by patch_id_defined() in patch-ids.c,
+	 * so we'll never be called with one.
+	 */
+	assert(!commit->parents || !commit->parents->next);
+
+	if (commit->parents)
+		diff_tree_oid(&commit->parents->item->object.oid,
+			      &commit->object.oid, "", opts);
+	else
+		diff_root_tree_oid(&commit->object.oid, "", opts);
+	diffcore_std(opts);
+
+	q = &diff_queued_diff;
+	for (int i = 0; i < q->nr; i++) {
+		struct diff_filepair *p = q->queue[i];
+		struct userdiff_driver *drv;
+
+		/* Skip binary files */
+		drv = userdiff_find_by_path(opts->repo->index, p->one->path);
+		if (drv && drv->binary > 0)
+			continue;
+
+		if (DIFF_FILE_VALID(p->one) &&
+		    odb_read_object_info_extended(opts->repo->objects,
+						  &p->one->oid, NULL,
+						  OBJECT_INFO_FOR_PREFETCH))
+			oidset_insert(blobs, &p->one->oid);
+		if (DIFF_FILE_VALID(p->two) &&
+		    odb_read_object_info_extended(opts->repo->objects,
+						  &p->two->oid, NULL,
+						  OBJECT_INFO_FOR_PREFETCH))
+			oidset_insert(blobs, &p->two->oid);
+	}
+	diff_queue_clear(q);
+}
+
+static int always_match(const void *cmp_data UNUSED,
+			const struct hashmap_entry *entry1 UNUSED,
+			const struct hashmap_entry *entry2 UNUSED,
+			const void *keydata UNUSED)
+{
+	return 0;
+}
+
+/*
+ * Prefetch blobs for git cherry in partial clones.
+ *
+ * Called between the revision walk (which builds the head-side
+ * commit list) and the has_commit_patch_id() comparison loop.
+ *
+ * Uses a cmpfn-swap trick to avoid reading blobs: temporarily
+ * replaces the hashmap's comparison function with a trivial
+ * always-match function, so hashmap_get()/hashmap_get_next() match
+ * any entry with the same oidhash bucket.  These are the set of oids
+ * that would trigger patch_id_neq() during normal lookup and cause
+ * blobs to be read on demand, and we want to prefetch them all at
+ * once instead.
+ */
+static void prefetch_cherry_blobs(struct repository *repo,
+				  struct commit_list *list,
+				  struct patch_ids *ids)
+{
+	struct oidset blobs = OIDSET_INIT;
+	hashmap_cmp_fn original_cmpfn;
+
+	/* Exit if we're not in a partial clone */
+	if (!repo_has_promisor_remote(repo))
+		return;
+
+	/* Save original cmpfn, replace with always_match */
+	original_cmpfn = ids->patches.cmpfn;
+	ids->patches.cmpfn = always_match;
+
+	/* Find header-only collisions, gather blobs from those commits */
+	for (struct commit_list *l = list; l; l = l->next) {
+		struct commit *c = l->item;
+		bool match_found = false;
+		for (struct patch_id *cur = patch_id_iter_first(c, ids);
+		     cur;
+		     cur = patch_id_iter_next(cur, ids)) {
+			match_found = true;
+			collect_diff_blob_oids(cur->commit, &ids->diffopts,
+					       &blobs);
+		}
+		if (match_found)
+			collect_diff_blob_oids(c, &ids->diffopts, &blobs);
+	}
+
+	/* Restore original cmpfn */
+	ids->patches.cmpfn = original_cmpfn;
+
+	/* If we have any blobs to fetch, fetch them */
+	if (oidset_size(&blobs)) {
+		struct oid_array to_fetch = OID_ARRAY_INIT;
+		struct oidset_iter iter;
+		const struct object_id *oid;
+
+		oidset_iter_init(&blobs, &iter);
+		while ((oid = oidset_iter_next(&iter)))
+			oid_array_append(&to_fetch, oid);
+
+		promisor_remote_get_direct(repo, to_fetch.oid, to_fetch.nr);
+
+		oid_array_clear(&to_fetch);
+	}
+
+	oidset_clear(&blobs);
 }
 
 int cmd_cherry(int argc,
@@ -2602,6 +2802,8 @@ int cmd_cherry(int argc,
 		commit_list_insert(commit, &list);
 	}
 
+	prefetch_cherry_blobs(the_repository, list, &ids);
+
 	for (struct commit_list *l = list; l; l = l->next) {
 		char sign = '+';
 
@@ -2611,7 +2813,7 @@ int cmd_cherry(int argc,
 		print_commit(sign, commit, verbose, abbrev, revs.diffopt.file);
 	}
 
-	free_commit_list(list);
+	commit_list_free(list);
 	free_patch_ids(&ids);
 	return 0;
 }

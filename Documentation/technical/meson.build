@@ -32,6 +32,7 @@ articles = [
   'sparse-checkout.adoc',
   'sparse-index.adoc',
   'trivial-merge.adoc',
+  'unambiguous-types.adoc',
   'unit-tests.adoc',
 ]
 
@@ -53,7 +54,7 @@ doc_targets += custom_target(
   output: 'api-index.html',
   depends: documentation_deps,
   install: true,
-  install_dir: get_option('datadir') / 'doc/git-doc/technical',
+  install_dir: htmldir / 'technical',
 )
 
 foreach article : api_docs + articles
@@ -63,6 +64,6 @@ foreach article : api_docs + articles
     output: fs.stem(article) + '.html',
     depends: documentation_deps,
     install: true,
-    install_dir: get_option('datadir') / 'doc/git-doc/technical',
+    install_dir: htmldir / 'technical',
   )
 endforeach

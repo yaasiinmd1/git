@@ -469,7 +469,7 @@ test_expect_success 'access using basic auth with wwwauth header empty continuat
 	EOF
 '
 
-test_expect_success 'access using basic auth with wwwauth header mixed line-endings' '
+test_expect_success 'access using basic auth with wwwauth header mixed continuations' '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -490,7 +490,7 @@ test_expect_success 'access using basic auth with wwwauth header mixed line-endi
 	printf "id=default response=WWW-Authenticate: FooBar param1=\"value1\"\r\n" >>"$CHALLENGE" &&
 	printf "id=default response= \r\n" >>"$CHALLENGE" &&
 	printf "id=default response=\tparam2=\"value2\"\r\n" >>"$CHALLENGE" &&
-	printf "id=default response=WWW-Authenticate: Basic realm=\"example.com\"" >>"$CHALLENGE" &&
+	printf "id=default response=WWW-Authenticate: Basic realm=\"example.com\"\r\n" >>"$CHALLENGE" &&
 
 	test_config_global credential.helper test-helper &&
 	git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
@@ -605,6 +605,51 @@ test_expect_success 'access using bearer auth with invalid credentials' '
 	EOF
 '
 
+test_expect_success 'clone with bearer auth and probe_rpc' '
+	test_when_finished "per_test_cleanup" &&
+	test_when_finished "rm -rf large.git" &&
+
+	# Set up a repository large enough to trigger probe_rpc
+	git init large.git &&
+	(
+		cd large.git &&
+		git config set maintenance.auto false &&
+		git commit --allow-empty --message "initial" &&
+		# Create many refs to trigger probe_rpc, which is called when
+		# the request body is larger than http.postBuffer.
+		#
+		# In the test later, http.postBuffer is set to 70000. Each
+		# "want" line is ~45 bytes, so we need at least 70000/45 = ~1600
+		# refs
+		test_seq -f "create refs/heads/branch-%d @" 2000 |
+		git update-ref --stdin
+	) &&
+	git clone --bare large.git "$HTTPD_DOCUMENT_ROOT_PATH/large.git" &&
+
+	# Clone it through HTTP with a Bearer token
+	set_credential_reply get <<-EOF &&
+	capability[]=authtype
+	authtype=Bearer
+	credential=YS1naXQtdG9rZW4=
+	EOF
+
+	# Bearer token
+	cat >"$HTTPD_ROOT_PATH/custom-auth.valid" <<-EOF &&
+	id=1 creds=Bearer YS1naXQtdG9rZW4=
+	EOF
+
+	cat >"$HTTPD_ROOT_PATH/custom-auth.challenge" <<-EOF &&
+	id=1 status=200
+	id=default response=WWW-Authenticate: Bearer authorize_uri="id.example.com"
+	EOF
+
+	# Set a small buffer to force probe_rpc to be called
+	# Must be > LARGE_PACKET_MAX (65520)
+	test_config_global http.postBuffer 70000 &&
+	test_config_global credential.helper test-helper &&
+	git clone "$HTTPD_URL/custom_auth/large.git" partial-auth-clone 2>clone-error
+'
+
 test_expect_success 'access using three-legged auth' '
 	test_when_finished "per_test_cleanup" &&
 
@@ -672,6 +717,80 @@ test_expect_success 'access using three-legged auth' '
 	host=$HTTPD_DEST
 	state[]=helper:bazquux
 	EOF
+'
+
+test_lazy_prereq SPNEGO 'curl --version | grep -qi "SPNEGO\|GSS-API\|Kerberos\|negotiate"'
+
+test_expect_success SPNEGO 'http.emptyAuth=auto attempts Negotiate before credential_fill' '
+	test_when_finished "per_test_cleanup" &&
+
+	set_credential_reply get <<-EOF &&
+	username=alice
+	password=secret-passwd
+	EOF
+
+	# Basic base64(alice:secret-passwd)
+	cat >"$HTTPD_ROOT_PATH/custom-auth.valid" <<-EOF &&
+	id=1 creds=Basic YWxpY2U6c2VjcmV0LXBhc3N3ZA==
+	EOF
+
+	cat >"$HTTPD_ROOT_PATH/custom-auth.challenge" <<-EOF &&
+	id=1 status=200
+	id=default response=WWW-Authenticate: Negotiate
+	id=default response=WWW-Authenticate: Basic realm="example.com"
+	EOF
+
+	test_config_global credential.helper test-helper &&
+	GIT_TRACE_CURL="$TRASH_DIRECTORY/trace-auto" \
+		git -c http.emptyAuth=auto \
+		ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+
+	# In auto mode with a Negotiate+Basic server, there should be
+	# three 401 responses: (1) initial no-auth request, (2) empty-auth
+	# retry where Negotiate fails (no Kerberos ticket), (3) libcurl
+	# internal Negotiate retry. The fourth attempt uses Basic
+	# credentials from credential_fill and succeeds.
+	grep "HTTP/[0-9.]* 401" "$TRASH_DIRECTORY/trace-auto" >actual_401s &&
+	test_line_count = 3 actual_401s &&
+
+	expect_credential_query get <<-EOF
+	capability[]=authtype
+	capability[]=state
+	protocol=http
+	host=$HTTPD_DEST
+	wwwauth[]=Negotiate
+	wwwauth[]=Basic realm="example.com"
+	EOF
+'
+
+test_expect_success SPNEGO 'http.emptyAuth=false skips Negotiate' '
+	test_when_finished "per_test_cleanup" &&
+
+	set_credential_reply get <<-EOF &&
+	username=alice
+	password=secret-passwd
+	EOF
+
+	# Basic base64(alice:secret-passwd)
+	cat >"$HTTPD_ROOT_PATH/custom-auth.valid" <<-EOF &&
+	id=1 creds=Basic YWxpY2U6c2VjcmV0LXBhc3N3ZA==
+	EOF
+
+	cat >"$HTTPD_ROOT_PATH/custom-auth.challenge" <<-EOF &&
+	id=1 status=200
+	id=default response=WWW-Authenticate: Negotiate
+	id=default response=WWW-Authenticate: Basic realm="example.com"
+	EOF
+
+	test_config_global credential.helper test-helper &&
+	GIT_TRACE_CURL="$TRASH_DIRECTORY/trace-false" \
+		git -c http.emptyAuth=false \
+		ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+
+	# With emptyAuth=false, Negotiate is stripped immediately and
+	# credential_fill is called right away. Only one 401 response.
+	grep "HTTP/[0-9.]* 401" "$TRASH_DIRECTORY/trace-false" >actual_401s &&
+	test_line_count = 1 actual_401s
 '
 
 test_done

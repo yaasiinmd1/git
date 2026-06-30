@@ -48,6 +48,9 @@ test_decode_color () {
 			if (n == 2) return "FAINT";
 			if (n == 3) return "ITALIC";
 			if (n == 7) return "REVERSE";
+			if (n == 22) return "NORMAL_INTENSITY";
+			if (n == 23) return "NOITALIC";
+			if (n == 27) return "NOREVERSE";
 			if (n == 30) return "BLACK";
 			if (n == 31) return "RED";
 			if (n == 32) return "GREEN";
@@ -1192,8 +1195,9 @@ test_must_fail () {
 		echo >&7 "test_must_fail: only 'git' is allowed: $*"
 		return 1
 	fi
-	"$@" 2>&7
-	exit_code=$?
+
+	exit_code=0; "$@" 2>&7 || exit_code=$?
+
 	if test $exit_code -eq 0 && ! list_contains "$_test_ok" success
 	then
 		echo >&4 "test_must_fail: command succeeded: $*"
@@ -1244,8 +1248,7 @@ test_might_fail () {
 test_expect_code () {
 	want_code=$1
 	shift
-	"$@" 2>&7
-	exit_code=$?
+	exit_code=0; "$@" 2>&7 || exit_code=$?
 	if test $exit_code = $want_code
 	then
 		return 0
@@ -1509,7 +1512,7 @@ test_when_finished () {
 	test "${BASH_SUBSHELL-0}" = 0 ||
 	BUG "test_when_finished does nothing in a subshell"
 	test_cleanup="{ $*
-		} && (exit \"\$eval_ret\"); eval_ret=\$?; $test_cleanup"
+		} || eval_ret=\$?; $test_cleanup"
 }
 
 # This function can be used to schedule some commands to be run
@@ -1537,7 +1540,7 @@ test_atexit () {
 	test "${BASH_SUBSHELL-0}" = 0 ||
 	BUG "test_atexit does nothing in a subshell"
 	test_atexit_cleanup="{ $*
-		} && (exit \"\$eval_ret\"); eval_ret=\$?; $test_atexit_cleanup"
+		} || eval_ret=\$?; $test_atexit_cleanup"
 }
 
 # Deprecated wrapper for "git init", use "git init" directly instead
@@ -1724,7 +1727,7 @@ test_detect_hash () {
 	esac
 }
 
-# Detect the hash algorithm in use.
+# Detect the ref format in use.
 test_detect_ref_format () {
 	echo "${GIT_TEST_DEFAULT_REF_FORMAT:-files}"
 }
@@ -2065,4 +2068,12 @@ test_trailing_hash () {
 # correspond to decimal intervals 1-32 and 127-255
 test_redact_non_printables () {
     tr -d "\n\r" | tr "[\001-\040][\177-\377]" "."
+}
+
+# Remove .gitconfig entries from a file in place.  test-lib.sh may
+# create $HOME/.gitconfig (e.g. to set safe.bareRepository) which
+# can appear in ls-files or status output.
+test_filter_gitconfig () {
+	sed "/\\.gitconfig/d" "$1" >"$1.filtered" &&
+	mv "$1.filtered" "$1"
 }

@@ -4,6 +4,7 @@
 #include "commit.h"
 #include "grep.h"
 #include "notes.h"
+#include "object-name.h"
 #include "oidset.h"
 #include "pretty.h"
 #include "diff.h"
@@ -11,6 +12,7 @@
 #include "decorate.h"
 #include "ident.h"
 #include "list-objects-filter-options.h"
+#include "prio-queue.h"
 #include "strvec.h"
 
 /**
@@ -52,7 +54,9 @@
 #define NOT_USER_GIVEN	(1u<<25)
 #define TRACK_LINEAR	(1u<<26)
 #define ANCESTRY_PATH	(1u<<27)
-#define ALL_REV_FLAGS	(((1u<<11)-1) | NOT_USER_GIVEN | TRACK_LINEAR | PULL_MERGE)
+#define CHILD_VISITED	(1u<<28)
+#define ALL_REV_FLAGS	(((1u<<11)-1) | NOT_USER_GIVEN | TRACK_LINEAR \
+				      | PULL_MERGE | CHILD_VISITED)
 
 #define DECORATE_SHORT_REFS	1
 #define DECORATE_FULL_REFS	2
@@ -119,8 +123,14 @@ struct oidset;
 struct topo_walk_info;
 
 struct rev_info {
-	/* Starting list */
+	/*
+	 * Work queue of commits, stored as either a linked list or a
+	 * priority queue, but never both at the same time.
+	 * rev_info_commit_list_to_queue() converts list to queue.
+	 */
 	struct commit_list *commits;
+	struct prio_queue commit_queue;
+
 	struct object_array pending;
 	struct repository *repo;
 
@@ -189,6 +199,7 @@ struct rev_info {
 			left_right:1,
 			left_only:1,
 			right_only:1,
+			maximal_only:1,
 			rewrite_parents:1,
 			print_parents:1,
 			show_decorations:1,
@@ -301,10 +312,13 @@ struct rev_info {
 
 	/* Display history graph */
 	struct git_graph *graph;
+	int graph_max_lanes;
 
 	/* special limits */
 	int skip_count;
 	int max_count;
+	unsigned int max_count_type:1;
+	unsigned int max_count_stage:1;
 	timestamp_t max_age;
 	timestamp_t max_age_as_filter;
 	timestamp_t min_age;
@@ -396,6 +410,7 @@ struct rev_info {
  * uninitialized.
  */
 #define REV_INFO_INIT { \
+	.commit_queue = { .compare = compare_commits_by_commit_date }, \
 	.abbrev = DEFAULT_ABBREV, \
 	.simplify_history = 1, \
 	.pruning.flags.recursive = 1, \
@@ -474,6 +489,8 @@ void reset_revision_walk(void);
  */
 int prepare_revision_walk(struct rev_info *revs);
 
+/* Drain the commits linked list into the priority queue. */
+void rev_info_commit_list_to_queue(struct rev_info *revs);
 /**
  * Takes a pointer to a `rev_info` structure and iterates over it, returning a
  * `struct commit *` each time you call it. The end of the revision list is

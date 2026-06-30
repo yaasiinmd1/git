@@ -31,6 +31,12 @@ Initial setup:
 . "$TEST_DIRECTORY"/lib-rebase.sh
 
 test_expect_success 'setup' '
+	# Commit dates are hardcoded to 2005, and the reflog entries will have
+	# a matching timestamp. Maintenance may thus immediately expire
+	# reflogs if it was running.
+	git config set gc.reflogExpire never &&
+	git config set gc.reflogExpireUnreachable never &&
+
 	git switch -C primary &&
 	test_commit A file1 &&
 	test_commit B file1 &&
@@ -1952,6 +1958,24 @@ test_expect_success '--update-refs adds commands with --rebase-merges' '
 
 		test_cmp expect todo
 	)
+'
+
+test_expect_success '--update-refs ignores non-branch decorations' '
+	test_when_finished "git branch -D update-refs" &&
+	test_when_finished "git checkout primary" &&
+	git checkout -B update-refs no-conflict-branch &&
+	(
+		set_cat_todo_editor &&
+
+		# rebase.instructionFormat=%d loads normal log decorations before
+		# --update-refs adds its branch placeholders so we must ignore
+		# all non-local decorations.
+		test_must_fail git -c rebase.instructionFormat="%s%d" \
+			rebase -i --update-refs HEAD^ >todo
+	) &&
+	grep ^update-ref todo >actual &&
+	test_write_lines "update-ref refs/heads/no-conflict-branch" >expect &&
+	test_cmp expect actual
 '
 
 test_expect_success '--update-refs updates refs correctly' '

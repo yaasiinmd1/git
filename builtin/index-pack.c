@@ -16,12 +16,12 @@
 #include "progress.h"
 #include "fsck.h"
 #include "strbuf.h"
-#include "streaming.h"
 #include "thread-utils.h"
 #include "packfile.h"
 #include "pack-revindex.h"
 #include "object-file.h"
 #include "odb.h"
+#include "odb/streaming.h"
 #include "oid-array.h"
 #include "oidset.h"
 #include "path.h"
@@ -37,7 +37,7 @@ static const char index_pack_usage[] =
 
 struct object_entry {
 	struct pack_idx_entry idx;
-	unsigned long size;
+	size_t size;
 	unsigned char hdr_size;
 	signed char type;
 	signed char real_type;
@@ -71,7 +71,7 @@ struct base_data {
 	/* Not initialized by make_base(). */
 	struct list_head list;
 	void *data;
-	unsigned long size;
+	size_t size;
 };
 
 /*
@@ -136,7 +136,7 @@ static int nr_threads;
 static int from_stdin;
 static int strict;
 static int do_fsck_object;
-static struct fsck_options fsck_options = FSCK_OPTIONS_MISSING_GITMODULES;
+static struct fsck_options fsck_options;
 static int verbose;
 static const char *progress_title;
 static int show_resolving_progress;
@@ -145,8 +145,7 @@ static int check_self_contained_and_connected;
 
 static struct progress *progress;
 
-/* We always read in 4kB chunks. */
-static unsigned char input_buffer[4096];
+static unsigned char input_buffer[DEFAULT_IO_BUFFER_SIZE];
 static unsigned int input_offset, input_len;
 static off_t consumed_bytes;
 static off_t max_input_size;
@@ -259,7 +258,7 @@ static unsigned check_object(struct object *obj)
 		return 0;
 
 	if (!(obj->flags & FLAG_CHECKED)) {
-		unsigned long size;
+		size_t size;
 		int type = odb_read_object_info(the_repository->objects,
 						&obj->oid, &size);
 		if (type <= 0)
@@ -469,7 +468,7 @@ static int is_delta_type(enum object_type type)
 	return (type == OBJ_REF_DELTA || type == OBJ_OFS_DELTA);
 }
 
-static void *unpack_entry_data(off_t offset, unsigned long size,
+static void *unpack_entry_data(off_t offset, size_t size,
 			       enum object_type type, struct object_id *oid)
 {
 	static char fixed_buf[8192];
@@ -524,7 +523,7 @@ static void *unpack_raw_entry(struct object_entry *obj,
 			      struct object_id *oid)
 {
 	unsigned char *p;
-	unsigned long size, c;
+	size_t size, c;
 	off_t base_offset;
 	unsigned shift;
 	void *data;
@@ -539,6 +538,8 @@ static void *unpack_raw_entry(struct object_entry *obj,
 	size = (c & 15);
 	shift = 4;
 	while (c & 0x80) {
+		if ((bitsizeof(size_t) - 7) < shift)
+			die(_("object size too large for this platform"));
 		p = fill(1);
 		c = *p;
 		use(1);
@@ -762,7 +763,7 @@ static void find_ref_delta_children(const struct object_id *oid,
 
 struct compare_data {
 	struct object_entry *entry;
-	struct git_istream *st;
+	struct odb_read_stream *st;
 	unsigned char *buf;
 	unsigned long buf_size;
 };
@@ -779,7 +780,7 @@ static int compare_objects(const unsigned char *buf, unsigned long size,
 	}
 
 	while (size) {
-		ssize_t len = read_istream(data->st, data->buf, size);
+		ssize_t len = odb_read_stream_read(data->st, data->buf, size);
 		if (len == 0)
 			die(_("SHA1 COLLISION FOUND WITH %s !"),
 			    oid_to_hex(&data->entry->idx.oid));
@@ -798,8 +799,6 @@ static int compare_objects(const unsigned char *buf, unsigned long size,
 static int check_collison(struct object_entry *entry)
 {
 	struct compare_data data;
-	enum object_type type;
-	unsigned long size;
 
 	if (entry->size <= repo_settings_get_big_file_threshold(the_repository) ||
 	    entry->type != OBJ_BLOB)
@@ -807,15 +806,14 @@ static int check_collison(struct object_entry *entry)
 
 	memset(&data, 0, sizeof(data));
 	data.entry = entry;
-	data.st = open_istream(the_repository, &entry->idx.oid, &type, &size,
-			       NULL);
+	data.st = odb_read_stream_open(the_repository->objects, &entry->idx.oid, NULL);
 	if (!data.st)
 		return -1;
-	if (size != entry->size || type != entry->type)
+	if (data.st->size != entry->size || data.st->type != entry->type)
 		die(_("SHA1 COLLISION FOUND WITH %s !"),
 		    oid_to_hex(&entry->idx.oid));
 	unpack_data(entry, compare_objects, &data);
-	close_istream(data.st);
+	odb_read_stream_close(data.st);
 	free(data.buf);
 	return 0;
 }
@@ -894,7 +892,7 @@ static void sha1_object(const void *data, struct object_entry *obj_entry,
 	if (startup_info->have_repository) {
 		read_lock();
 		collision_test_needed = odb_has_object(the_repository->objects, oid,
-						       HAS_OBJECT_FETCH_PROMISOR);
+						       ODB_HAS_OBJECT_FETCH_PROMISOR);
 		read_unlock();
 	}
 
@@ -907,7 +905,7 @@ static void sha1_object(const void *data, struct object_entry *obj_entry,
 	if (collision_test_needed) {
 		void *has_data;
 		enum object_type has_type;
-		unsigned long has_size;
+		size_t has_size;
 		read_lock();
 		has_type = odb_read_object_info(the_repository->objects, oid, &has_size);
 		if (has_type < 0)
@@ -1050,7 +1048,7 @@ static struct base_data *resolve_delta(struct object_entry *delta_obj,
 {
 	void *delta_data, *result_data;
 	struct base_data *result;
-	unsigned long result_size;
+	size_t result_size;
 
 	if (show_stat) {
 		int i = delta_obj - objects;
@@ -1214,7 +1212,6 @@ static void *threaded_second_pass(void *data)
 			list_add(&child->list, &work_head);
 			base_cache_used += child->size;
 			prune_base_data(NULL);
-			free_base_data(child);
 		} else if (child) {
 			/*
 			 * This child does not have its own children. It may be
@@ -1419,8 +1416,9 @@ static int write_compressed(struct hashfile *f, void *in, unsigned int size)
 	git_zstream stream;
 	int status;
 	unsigned char outbuf[4096];
+	struct repo_config_values *cfg = repo_config_values(the_repository);
 
-	git_deflate_init(&stream, zlib_compression_level);
+	git_deflate_init(&stream, cfg->zlib_compression_level);
 	stream.next_in = in;
 	stream.avail_in = size;
 
@@ -1517,7 +1515,7 @@ static void fix_unresolved_deltas(struct hashfile *f)
 		struct ref_delta_entry *d = sorted_by_pos[i];
 		enum object_type type;
 		void *data;
-		unsigned long size;
+		size_t size;
 
 		if (objects[d->obj_no].real_type != OBJ_REF_DELTA)
 			continue;
@@ -1640,9 +1638,11 @@ static void final(const char *final_pack_name, const char *curr_pack_name,
 	rename_tmp_packfile(&final_index_name, curr_index_name, &index_name,
 			    hash, "idx", 1);
 
-	if (do_fsck_object)
-		packfile_store_load_pack(the_repository->objects->packfiles,
-					 final_index_name, 0);
+	if (do_fsck_object && startup_info->have_repository) {
+		struct odb_source_files *files =
+			odb_source_files_downcast(the_repository->objects->sources);
+		packfile_store_load_pack(files->packed, final_index_name, 0);
+	}
 
 	if (!from_stdin) {
 		printf("%s\n", hash_to_hex(hash));
@@ -1909,6 +1909,8 @@ int cmd_index_pack(int argc,
 	show_usage_if_asked(argc, argv, index_pack_usage);
 
 	disable_replace_refs();
+
+	fsck_options_init(&fsck_options, the_repository, FSCK_OPTIONS_MISSING_GITMODULES);
 	fsck_options.walk = mark_link;
 
 	reset_pack_idx_option(&opts);
@@ -2110,8 +2112,23 @@ int cmd_index_pack(int argc,
 	else
 		close(input_fd);
 
-	if (do_fsck_object && fsck_finish(&fsck_options))
-		die(_("fsck error in pack objects"));
+	if (do_fsck_object) {
+		/*
+		 * We cannot perform queued consistency checks when running
+		 * outside of a repository because those require us to read
+		 * from the object database, which is uninitialized.
+		 *
+		 * TODO: we may eventually set up an in-memory object database,
+		 * which would allow us to perform these queued checks.
+		 */
+		if (!startup_info->have_repository &&
+		    fsck_has_queued_checks(&fsck_options))
+			die(_("cannot perform queued object checks outside "
+			      "of a repository"));
+
+		if (fsck_finish(&fsck_options))
+			die(_("fsck error in pack objects"));
+	}
 
 	free(opts.anomaly);
 	free(objects);

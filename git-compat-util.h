@@ -34,41 +34,8 @@ struct strbuf;
 #  define DISABLE_WARNING(warning)
 #endif
 
-#ifdef DISABLE_SIGN_COMPARE_WARNINGS
-DISABLE_WARNING(-Wsign-compare)
-#endif
-
-#ifndef FLEX_ARRAY
-/*
- * See if our compiler is known to support flexible array members.
- */
-
-/*
- * Check vendor specific quirks first, before checking the
- * __STDC_VERSION__, as vendor compilers can lie and we need to be
- * able to work them around.  Note that by not defining FLEX_ARRAY
- * here, we can fall back to use the "safer but a bit wasteful" one
- * later.
- */
-#if defined(__SUNPRO_C) && (__SUNPRO_C <= 0x580)
-#elif defined(__GNUC__)
-# if (__GNUC__ >= 3)
-#  define FLEX_ARRAY /* empty */
-# else
-#  define FLEX_ARRAY 0 /* older GNU extension */
-# endif
-#elif defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)
-# define FLEX_ARRAY /* empty */
-#endif
-
-/*
- * Otherwise, default to safer but a bit wasteful traditional style
- */
-#ifndef FLEX_ARRAY
-# define FLEX_ARRAY 1
-#endif
-#endif
-
+#undef FLEX_ARRAY
+#define FLEX_ARRAY /* empty - weather balloon to require C99 FAM */
 
 /*
  * BUILD_ASSERT_OR_ZERO - assert a build-time dependency, as an expression.
@@ -368,11 +335,7 @@ static inline int is_path_owned_by_current_uid(const char *path,
 #endif
 
 #ifndef find_last_dir_sep
-static inline char *git_find_last_dir_sep(const char *path)
-{
-	return strrchr(path, '/');
-}
-#define find_last_dir_sep git_find_last_dir_sep
+#define find_last_dir_sep(path) strrchr((path), '/')
 #endif
 
 #ifndef has_dir_sep
@@ -501,6 +464,21 @@ report_fn get_warn_routine(void);
 void set_die_is_recursing_routine(int (*routine)(void));
 
 /*
+ * Check that an out-parameter is "at least as const as" a matching
+ * in-parameter. For example, skip_prefix() will return "out" that is a subset
+ * of "str". So:
+ *
+ *  const str, const out: ok
+ *  non-const str, const out: ok
+ *  non-const str, non-const out: ok
+ *  const str, non-const out: compile error
+ *
+ *  See the skip_prefix macro below for an example of use.
+ */
+#define CONST_OUTPARAM(in, out) \
+	((const char **)(0 ? ((*(out) = (in)),(out)) : (out)))
+
+/*
  * If the string "str" begins with the string found in "prefix", return true.
  * The "out" parameter is set to "str + strlen(prefix)" (i.e., to the point in
  * the string right after the prefix).
@@ -516,8 +494,10 @@ void set_die_is_recursing_routine(int (*routine)(void));
  *   [skip prefix if present, otherwise use whole string]
  *   skip_prefix(name, "refs/heads/", &name);
  */
-static inline bool skip_prefix(const char *str, const char *prefix,
-			       const char **out)
+#define skip_prefix(str, prefix, out) \
+	skip_prefix_impl((str), (prefix), CONST_OUTPARAM((str), (out)))
+static inline bool skip_prefix_impl(const char *str, const char *prefix,
+				    const char **out)
 {
 	do {
 		if (!*prefix) {
@@ -607,15 +587,57 @@ static inline bool strip_suffix(const char *str, const char *suffix,
 #define DEFAULT_PACKED_GIT_LIMIT \
 	((1024L * 1024L) * (size_t)(sizeof(void*) >= 8 ? (32 * 1024L * 1024L) : 256))
 
+#ifdef _MSC_VER
+  /*
+   * When traversing into too-deep trees, Visual C-compiled Git seems to
+   * run into some internal stack overflow detection in the
+   * `RtlpAllocateHeap()` function that is called from within
+   * `git_inflate_init()`'s call tree. The following value seems to be
+   * low enough to avoid that by letting Git exit with an error before
+   * the stack overflow can occur.
+   */
+#define DEFAULT_MAX_ALLOWED_TREE_DEPTH 512
+#elif defined(GIT_WINDOWS_NATIVE) && defined(__clang__) && defined(__aarch64__)
+  /*
+   * Similar to Visual C, it seems that on Windows/ARM64 the clang-based
+   * builds have a smaller stack space available. When running out of
+   * that stack space, a `STATUS_STACK_OVERFLOW` is produced. When the
+   * Git command was run from an MSYS2 Bash, this unfortunately results
+   * in an exit code 127. Let's prevent that by lowering the maximal
+   * tree depth; This value seems to be low enough.
+   */
+#define DEFAULT_MAX_ALLOWED_TREE_DEPTH 1280
+#else
+#define DEFAULT_MAX_ALLOWED_TREE_DEPTH 2048
+#endif
+
 int git_open_cloexec(const char *name, int flags);
 #define git_open(name) git_open_cloexec(name, O_RDONLY)
 
-static inline size_t st_add(size_t a, size_t b)
+
+/*
+ * Help Clang; GCC generates the same instructions for both variants on
+ * x64 and aarch64.
+ */
+#ifdef __clang__
+#define st_add_overflow __builtin_add_overflow
+#else
+static inline bool st_add_overflow(size_t a, size_t b, size_t *out)
 {
 	if (unsigned_add_overflows(a, b))
+		return true;
+	*out = a + b;
+	return false;
+}
+#endif
+
+static inline size_t st_add(size_t a, size_t b)
+{
+	size_t result;
+	if (st_add_overflow(a, b, &result))
 		die("size_t overflow: %"PRIuMAX" + %"PRIuMAX,
 		    (uintmax_t)a, (uintmax_t)b);
-	return a + b;
+	return result;
 }
 #define st_add3(a,b,c)   st_add(st_add((a),(b)),(c))
 #define st_add4(a,b,c,d) st_add(st_add3((a),(b),(c)),(d))
@@ -708,6 +730,12 @@ static inline uint64_t u64_add(uint64_t a, uint64_t b)
 # endif
 #endif
 
+/*
+ * Default buffer size for buffered I/O in index-pack, unpack-objects,
+ * and the hashfile layer in csum-file.
+ */
+#define DEFAULT_IO_BUFFER_SIZE (128 * 1024)
+
 #ifdef HAVE_ALLOCA_H
 # include <alloca.h>
 # define xalloca(size)      (alloca(size))
@@ -726,6 +754,7 @@ static inline uint64_t u64_add(uint64_t a, uint64_t b)
 #define ALLOC_ARRAY(x, alloc) (x) = xmalloc(st_mult(sizeof(*(x)), (alloc)))
 #define CALLOC_ARRAY(x, alloc) (x) = xcalloc((alloc), sizeof(*(x)))
 #define REALLOC_ARRAY(x, alloc) (x) = xrealloc((x), st_mult(sizeof(*(x)), (alloc)))
+#define MEMZERO_ARRAY(x, alloc) memset((x), 0x0, st_mult(sizeof(*(x)), (alloc)))
 
 #define COPY_ARRAY(dst, src, n) copy_array((dst), (src), (n), sizeof(*(dst)) + \
 	BARF_UNLESS_COPYABLE((dst), (src)))
@@ -897,8 +926,10 @@ static inline size_t xsize_t(off_t len)
  * is done via tolower(), so it is strictly ASCII (no multi-byte characters or
  * locale-specific conversions).
  */
-static inline bool skip_iprefix(const char *str, const char *prefix,
-			       const char **out)
+#define skip_iprefix(str, prefix, out) \
+	skip_iprefix_impl((str), (prefix), CONST_OUTPARAM((str), (out)))
+static inline bool skip_iprefix_impl(const char *str, const char *prefix,
+				     const char **out)
 {
 	do {
 		if (!*prefix) {
@@ -1102,4 +1133,8 @@ extern int not_supposed_to_survive;
 #define assert(expr) ((void)(not_supposed_to_survive || (expr)))
 #endif /* CHECK_ASSERTION_SIDE_EFFECTS */
 
+#endif
+
+#ifdef DISABLE_SIGN_COMPARE_WARNINGS
+DISABLE_WARNING(-Wsign-compare)
 #endif

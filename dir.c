@@ -324,7 +324,7 @@ static int do_read_blob(const struct object_id *oid, struct oid_stat *oid_stat,
 			size_t *size_out, char **data_out)
 {
 	enum object_type type;
-	unsigned long sz;
+	size_t sz;
 	char *data;
 
 	*size_out = 0;
@@ -1388,18 +1388,25 @@ int match_pathname(const char *pathname, int pathlen,
 
 		if (fspathncmp(pattern, name, prefix))
 			return 0;
-		pattern += prefix;
-		patternlen -= prefix;
-		name    += prefix;
-		namelen -= prefix;
 
 		/*
 		 * If the whole pattern did not have a wildcard,
 		 * then our prefix match is all we need; we
 		 * do not need to call fnmatch at all.
 		 */
-		if (!patternlen && !namelen)
+		if (patternlen == prefix && namelen == prefix)
 			return 1;
+
+		/*
+		 * Retain one character of the prefix to
+		 * pass to fnmatch, which lets it distinguish
+		 * the start of a directory component correctly.
+		 */
+		prefix--;
+		pattern += prefix;
+		patternlen -= prefix;
+		name    += prefix;
+		namelen -= prefix;
 	}
 
 	return fnmatch_icase_mem(pattern, patternlen,
@@ -1544,7 +1551,9 @@ done:
 
 int init_sparse_checkout_patterns(struct index_state *istate)
 {
-	if (!core_apply_sparse_checkout)
+	struct repo_config_values *cfg = repo_config_values(the_repository);
+
+	if (!cfg->apply_sparse_checkout)
 		return 1;
 	if (istate->sparse_checkout_patterns)
 		return 0;
@@ -2976,7 +2985,7 @@ static struct untracked_cache_dir *validate_untracked_cache(struct dir_struct *d
 		return NULL;
 
 	/*
-	 * We only support $GIT_DIR/info/exclude and core.excludesfile
+	 * We only support $GIT_COMMON_DIR/info/exclude and core.excludesfile
 	 * as the global ignore rule files. Any other additions
 	 * (e.g. from command line) invalidate the cache. This
 	 * condition also catches running setup_standard_excludes()
@@ -3069,7 +3078,7 @@ static struct untracked_cache_dir *validate_untracked_cache(struct dir_struct *d
 		istate->cache_changed |= UNTRACKED_CHANGED;
 	}
 
-	/* Validate $GIT_DIR/info/exclude and core.excludesfile */
+	/* Validate $GIT_COMMON_DIR/info/exclude and core.excludesfile */
 	root = dir->untracked->root;
 	if (!oideq(&dir->internal.ss_info_exclude.oid,
 		   &dir->untracked->ss_info_exclude.oid)) {
@@ -3499,8 +3508,9 @@ int get_sparse_checkout_patterns(struct pattern_list *pl)
 {
 	int res;
 	char *sparse_filename = get_sparse_checkout_filename();
+	struct repo_config_values *cfg = repo_config_values(the_repository);
 
-	pl->use_cone_patterns = core_sparse_checkout_cone;
+	pl->use_cone_patterns = cfg->core_sparse_checkout_cone;
 	res = add_patterns_from_file_to_list(sparse_filename, "", 0, pl, NULL, 0);
 
 	free(sparse_filename);
@@ -3509,15 +3519,15 @@ int get_sparse_checkout_patterns(struct pattern_list *pl)
 
 int remove_path(const char *name)
 {
-	char *slash;
+	const char *last;
 
 	if (unlink(name) && !is_missing_file_error(errno))
 		return -1;
 
-	slash = strrchr(name, '/');
-	if (slash) {
+	last = strrchr(name, '/');
+	if (last) {
 		char *dirs = xstrdup(name);
-		slash = dirs + (slash - name);
+		char *slash = dirs + (last - name);
 		do {
 			*slash = '\0';
 			if (startup_info->original_cwd &&

@@ -9,6 +9,8 @@
 #include "hex.h"
 #include "object-file.h"
 #include "odb.h"
+#include "odb/streaming.h"
+#include "odb/transaction.h"
 #include "object.h"
 #include "delta.h"
 #include "pack.h"
@@ -23,13 +25,12 @@
 static int dry_run, quiet, recover, has_errors, strict;
 static const char unpack_usage[] = "git unpack-objects [-n] [-q] [-r] [--strict]";
 
-/* We always read in 4kB chunks. */
-static unsigned char buffer[4096];
+static unsigned char buffer[DEFAULT_IO_BUFFER_SIZE];
 static unsigned int offset, len;
 static off_t consumed_bytes;
 static off_t max_input_size;
 static struct git_hash_ctx ctx;
-static struct fsck_options fsck_options = FSCK_OPTIONS_STRICT;
+static struct fsck_options fsck_options;
 static struct progress *progress;
 
 /*
@@ -230,7 +231,7 @@ static int check_object(struct object *obj, enum object_type type,
 		die("object type mismatch");
 
 	if (!(obj->flags & FLAG_OPEN)) {
-		unsigned long size;
+		size_t size;
 		int type = odb_read_object_info(the_repository->objects, &obj->oid, &size);
 		if (type != obj->type || type <= 0)
 			die("object of unexpected type");
@@ -313,7 +314,7 @@ static void resolve_delta(unsigned nr, enum object_type type,
 			  void *delta, unsigned long delta_size)
 {
 	void *result;
-	unsigned long result_size;
+	size_t result_size;
 
 	result = patch_delta(base, base_size,
 			     delta, delta_size,
@@ -359,24 +360,21 @@ static void unpack_non_delta_entry(enum object_type type, unsigned long size,
 
 struct input_zstream_data {
 	git_zstream *zstream;
-	unsigned char buf[8192];
 	int status;
 };
 
-static const void *feed_input_zstream(struct input_stream *in_stream,
-				      unsigned long *readlen)
+static ssize_t feed_input_zstream(struct odb_write_stream *in_stream,
+				  unsigned char *buf, size_t buf_len)
 {
 	struct input_zstream_data *data = in_stream->data;
 	git_zstream *zstream = data->zstream;
 	void *in = fill(1);
 
-	if (in_stream->is_finished) {
-		*readlen = 0;
-		return NULL;
-	}
+	if (in_stream->is_finished)
+		return 0;
 
-	zstream->next_out = data->buf;
-	zstream->avail_out = sizeof(data->buf);
+	zstream->next_out = buf;
+	zstream->avail_out = buf_len;
 	zstream->next_in = in;
 	zstream->avail_in = len;
 
@@ -384,16 +382,14 @@ static const void *feed_input_zstream(struct input_stream *in_stream,
 
 	in_stream->is_finished = data->status != Z_OK;
 	use(len - zstream->avail_in);
-	*readlen = sizeof(data->buf) - zstream->avail_out;
-
-	return data->buf;
+	return buf_len - zstream->avail_out;
 }
 
 static void stream_blob(unsigned long size, unsigned nr)
 {
 	git_zstream zstream = { 0 };
 	struct input_zstream_data data = { 0 };
-	struct input_stream in_stream = {
+	struct odb_write_stream in_stream = {
 		.read = feed_input_zstream,
 		.data = &data,
 	};
@@ -402,8 +398,7 @@ static void stream_blob(unsigned long size, unsigned nr)
 	data.zstream = &zstream;
 	git_inflate_init(&zstream);
 
-	if (stream_loose_object(the_repository->objects->sources,
-				&in_stream, size, &info->oid))
+	if (odb_write_object_stream(the_repository->objects, &in_stream, size, &info->oid))
 		die(_("failed to write object in stream"));
 
 	if (data.status != Z_STREAM_END)
@@ -441,6 +436,7 @@ static void unpack_delta_entry(enum object_type type, unsigned long delta_size,
 {
 	void *delta_data, *base;
 	unsigned long base_size;
+	size_t base_size_st = 0;
 	struct object_id base_oid;
 
 	if (type == OBJ_REF_DELTA) {
@@ -450,7 +446,7 @@ static void unpack_delta_entry(enum object_type type, unsigned long delta_size,
 		if (!delta_data)
 			return;
 		if (odb_has_object(the_repository->objects, &base_oid,
-				   HAS_OBJECT_RECHECK_PACKED | HAS_OBJECT_FETCH_PROMISOR))
+				   ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR))
 			; /* Ok we have this one */
 		else if (resolve_against_held(nr, &base_oid,
 					      delta_data, delta_size))
@@ -517,7 +513,8 @@ static void unpack_delta_entry(enum object_type type, unsigned long delta_size,
 		return;
 
 	base = odb_read_object(the_repository->objects, &base_oid,
-			       &type, &base_size);
+			       &type, &base_size_st);
+	base_size = cast_size_t_to_ulong(base_size_st);
 	if (!base) {
 		error("failed to read delta-pack base object %s",
 		      oid_to_hex(&base_oid));
@@ -534,7 +531,7 @@ static void unpack_one(unsigned nr)
 {
 	unsigned shift;
 	unsigned char *pack;
-	unsigned long size, c;
+	size_t size, c;
 	enum object_type type;
 
 	obj_list[nr].offset = consumed_bytes;
@@ -546,6 +543,8 @@ static void unpack_one(unsigned nr)
 	size = (c & 15);
 	shift = 4;
 	while (c & 0x80) {
+		if ((bitsizeof(size_t) - 7) < shift)
+			die(_("object size too large for this platform"));
 		pack = fill(1);
 		c = *pack;
 		use(1);
@@ -614,7 +613,7 @@ static void unpack_all(void)
 int cmd_unpack_objects(int argc,
 		       const char **argv,
 		       const char *prefix UNUSED,
-		       struct repository *repo UNUSED)
+		       struct repository *repo)
 {
 	int i;
 	struct object_id oid;
@@ -627,6 +626,8 @@ int cmd_unpack_objects(int argc,
 	quiet = !isatty(2);
 
 	show_usage_if_asked(argc, argv, unpack_usage);
+
+	fsck_options_init(&fsck_options, repo, FSCK_OPTIONS_STRICT);
 
 	for (i = 1 ; i < argc; i++) {
 		const char *arg = argv[i];

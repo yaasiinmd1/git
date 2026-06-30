@@ -3,9 +3,9 @@
 
 struct strbuf;
 
-#define GPG_VERIFY_VERBOSE		1
-#define GPG_VERIFY_RAW			2
-#define GPG_VERIFY_OMIT_STATUS	4
+#define GPG_VERIFY_VERBOSE	(1<<0)
+#define GPG_VERIFY_RAW		(1<<1)
+#define GPG_VERIFY_OMIT_STATUS	(1<<2)
 
 enum signature_trust_level {
 	TRUST_UNDEFINED,
@@ -74,6 +74,15 @@ int parse_signature(const char *buf, size_t size, struct strbuf *payload, struct
  */
 size_t parse_signed_buffer(const char *buf, size_t size);
 
+/* Flags for sign_buffer(). */
+enum sign_buffer_flags {
+	/*
+	 * Use the default configured signing key as returned by `get_signing_key()`
+	 * when the provided "signing_key" is NULL or empty.
+	 */
+	SIGN_BUFFER_USE_DEFAULT_KEY = (1 << 0),
+};
+
 /*
  * Create a detached signature for the contents of "buffer" and append
  * it after "signature"; "buffer" and "signature" can be the same
@@ -81,8 +90,7 @@ size_t parse_signed_buffer(const char *buf, size_t size);
  * at the end.  Returns 0 on success, non-zero on failure.
  */
 int sign_buffer(struct strbuf *buffer, struct strbuf *signature,
-		const char *signing_key);
-
+		const char *signing_key, enum sign_buffer_flags flags);
 
 /*
  * Returns corresponding string in lowercase for a given member of
@@ -107,16 +115,21 @@ void print_signature_buffer(const struct signature_check *sigc,
 /* Modes for --signed-tags=<mode> and --signed-commits=<mode> options. */
 enum sign_mode {
 	SIGN_ABORT,
+	SIGN_ABORT_IF_INVALID,
 	SIGN_WARN_VERBATIM,
 	SIGN_VERBATIM,
 	SIGN_WARN_STRIP,
 	SIGN_STRIP,
+	SIGN_STRIP_IF_INVALID,
+	SIGN_SIGN_IF_INVALID,
 };
 
 /*
  * Return 0 if `arg` can be parsed into an `enum sign_mode`. Return -1
- * otherwise.
+ * otherwise. If the parsed mode is SIGN_SIGN_IF_INVALID and GPG key provided in
+ * the arguments in the form `sign-if-invalid=<keyid>`, the key-ID is parsed
+ * into `char **keyid`.
  */
-int parse_sign_mode(const char *arg, enum sign_mode *mode);
+int parse_sign_mode(const char *arg, enum sign_mode *mode, const char **keyid);
 
 #endif

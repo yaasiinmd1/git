@@ -10,6 +10,7 @@
 #include "builtin.h"
 
 #include "abspath.h"
+#include "bisect.h"
 #include "config.h"
 #include "commit.h"
 #include "environment.h"
@@ -217,19 +218,17 @@ static int show_default(void)
 	return 0;
 }
 
-static int show_reference(const char *refname, const char *referent UNUSED, const struct object_id *oid,
-			  int flag UNUSED, void *cb_data UNUSED)
+static int show_reference(const struct reference *ref, void *cb_data UNUSED)
 {
-	if (ref_excluded(&ref_excludes, refname))
+	if (ref_excluded(&ref_excludes, ref->name))
 		return 0;
-	show_rev(NORMAL, oid, refname);
+	show_rev(NORMAL, ref->oid, ref->name);
 	return 0;
 }
 
-static int anti_reference(const char *refname, const char *referent UNUSED, const struct object_id *oid,
-			  int flag UNUSED, void *cb_data UNUSED)
+static int anti_reference(const struct reference *ref, void *cb_data UNUSED)
 {
-	show_rev(REVERSED, oid, refname);
+	show_rev(REVERSED, ref->oid, ref->name);
 	return 0;
 }
 
@@ -269,21 +268,20 @@ static int show_file(const char *arg, int output_prefix)
 
 static int try_difference(const char *arg)
 {
-	char *dotdot;
+	const char *dotdot;
 	struct object_id start_oid;
 	struct object_id end_oid;
 	const char *end;
 	const char *start;
+	char *to_free;
 	int symmetric;
 	static const char head_by_default[] = "HEAD";
 
 	if (!(dotdot = strstr(arg, "..")))
 		return 0;
+	start = to_free = xmemdupz(arg, dotdot - arg);
 	end = dotdot + 2;
-	start = arg;
 	symmetric = (*end == '.');
-
-	*dotdot = 0;
 	end += symmetric;
 
 	if (!*end)
@@ -297,7 +295,7 @@ static int try_difference(const char *arg)
 		 * Just ".."?  That is not a range but the
 		 * pathspec for the parent directory.
 		 */
-		*dotdot = '.';
+		free(to_free);
 		return 0;
 	}
 
@@ -310,7 +308,7 @@ static int try_difference(const char *arg)
 			a = lookup_commit_reference(the_repository, &start_oid);
 			b = lookup_commit_reference(the_repository, &end_oid);
 			if (!a || !b) {
-				*dotdot = '.';
+				free(to_free);
 				return 0;
 			}
 			if (repo_get_merge_bases(the_repository, a, b, &exclude) < 0)
@@ -320,16 +318,16 @@ static int try_difference(const char *arg)
 				show_rev(REVERSED, &commit->object.oid, NULL);
 			}
 		}
-		*dotdot = '.';
+		free(to_free);
 		return 1;
 	}
-	*dotdot = '.';
+	free(to_free);
 	return 0;
 }
 
 static int try_parent_shorthands(const char *arg)
 {
-	char *dotdot;
+	const char *mark;
 	struct object_id oid;
 	struct commit *commit;
 	struct commit_list *parents;
@@ -337,38 +335,39 @@ static int try_parent_shorthands(const char *arg)
 	int include_rev = 0;
 	int include_parents = 0;
 	int exclude_parent = 0;
+	char *to_free;
 
-	if ((dotdot = strstr(arg, "^!"))) {
+	if ((mark = strstr(arg, "^!"))) {
 		include_rev = 1;
-		if (dotdot[2])
+		if (mark[2])
 			return 0;
-	} else if ((dotdot = strstr(arg, "^@"))) {
+	} else if ((mark = strstr(arg, "^@"))) {
 		include_parents = 1;
-		if (dotdot[2])
+		if (mark[2])
 			return 0;
-	} else if ((dotdot = strstr(arg, "^-"))) {
+	} else if ((mark = strstr(arg, "^-"))) {
 		include_rev = 1;
 		exclude_parent = 1;
 
-		if (dotdot[2]) {
+		if (mark[2]) {
 			char *end;
-			exclude_parent = strtoul(dotdot + 2, &end, 10);
+			exclude_parent = strtoul(mark + 2, &end, 10);
 			if (*end != '\0' || !exclude_parent)
 				return 0;
 		}
 	} else
 		return 0;
 
-	*dotdot = 0;
+	arg = to_free = xmemdupz(arg, mark - arg);
 	if (repo_get_oid_committish(the_repository, arg, &oid) ||
 	    !(commit = lookup_commit_reference(the_repository, &oid))) {
-		*dotdot = '^';
+		free(to_free);
 		return 0;
 	}
 
 	if (exclude_parent &&
 	    exclude_parent > commit_list_count(commit->parents)) {
-		*dotdot = '^';
+		free(to_free);
 		return 0;
 	}
 
@@ -389,7 +388,7 @@ static int try_parent_shorthands(const char *arg)
 		free(name);
 	}
 
-	*dotdot = '^';
+	free(to_free);
 	return 1;
 }
 
@@ -615,13 +614,22 @@ static int opt_with_value(const char *arg, const char *opt, const char **value)
 
 static void handle_ref_opt(const char *pattern, const char *prefix)
 {
-	if (pattern)
-		refs_for_each_glob_ref_in(get_main_ref_store(the_repository),
-					  show_reference, pattern, prefix,
-					  NULL);
-	else
-		refs_for_each_ref_in(get_main_ref_store(the_repository),
-				     prefix, show_reference, NULL);
+	if (pattern) {
+		struct refs_for_each_ref_options opts = {
+			.pattern = pattern,
+			.prefix = prefix,
+			.trim_prefix = prefix ? strlen(prefix) : 0,
+		};
+		refs_for_each_ref_ext(get_main_ref_store(the_repository),
+				      show_reference, NULL, &opts);
+	} else {
+		struct refs_for_each_ref_options opts = {
+			.prefix = prefix,
+			.trim_prefix = strlen(prefix),
+		};
+		refs_for_each_ref_ext(get_main_ref_store(the_repository),
+				      show_reference, NULL, &opts);
+	}
 	clear_ref_exclusions(&ref_excludes);
 }
 
@@ -732,7 +740,7 @@ int cmd_rev_parse(int argc,
 
 	/* No options; just report on whether we're in a git repo or not. */
 	if (argc == 1) {
-		setup_git_directory();
+		setup_git_directory(the_repository);
 		repo_config(the_repository, git_default_config, NULL);
 		return 0;
 	}
@@ -742,7 +750,7 @@ int cmd_rev_parse(int argc,
 
 		if (as_is) {
 			if (show_file(arg, output_prefix) && as_is < 2)
-				verify_filename(prefix, arg, 0);
+				verify_filename(the_repository, prefix, arg, 0);
 			continue;
 		}
 
@@ -767,7 +775,7 @@ int cmd_rev_parse(int argc,
 
 		/* The rest of the options require a git repository. */
 		if (!did_repo_setup) {
-			prefix = setup_git_directory();
+			prefix = setup_git_directory(the_repository);
 			repo_config(the_repository, git_default_config, NULL);
 			did_repo_setup = 1;
 
@@ -933,14 +941,23 @@ int cmd_rev_parse(int argc,
 				continue;
 			}
 			if (!strcmp(arg, "--bisect")) {
-				refs_for_each_fullref_in(get_main_ref_store(the_repository),
-							 "refs/bisect/bad",
-							 NULL, show_reference,
-							 NULL);
-				refs_for_each_fullref_in(get_main_ref_store(the_repository),
-							 "refs/bisect/good",
-							 NULL, anti_reference,
-							 NULL);
+				char *prefix;
+				char *term_bad = NULL;
+				char *term_good = NULL;
+				struct refs_for_each_ref_options opts = { 0 };
+				read_bisect_terms(&term_bad, &term_good);
+				prefix = xstrfmt("refs/bisect/%s", term_bad);
+				opts.prefix = prefix;
+				refs_for_each_ref_ext(get_main_ref_store(the_repository),
+						      show_reference, NULL, &opts);
+				free(prefix);
+				prefix = xstrfmt("refs/bisect/%s", term_good);
+				opts.prefix = prefix;
+				refs_for_each_ref_ext(get_main_ref_store(the_repository),
+						      anti_reference, NULL, &opts);
+				free(prefix);
+				free(term_good);
+				free(term_bad);
 				continue;
 			}
 			if (opt_with_value(arg, "--branches", &arg)) {
@@ -1000,7 +1017,7 @@ int cmd_rev_parse(int argc,
 			}
 			if (!strcmp(arg, "--show-cdup")) {
 				const char *pfx = prefix;
-				if (!is_inside_work_tree()) {
+				if (!is_inside_work_tree(the_repository)) {
 					const char *work_tree =
 						repo_get_work_tree(the_repository);
 					if (work_tree)
@@ -1057,12 +1074,12 @@ int cmd_rev_parse(int argc,
 				continue;
 			}
 			if (!strcmp(arg, "--is-inside-git-dir")) {
-				printf("%s\n", is_inside_git_dir() ? "true"
+				printf("%s\n", is_inside_git_dir(the_repository) ? "true"
 						: "false");
 				continue;
 			}
 			if (!strcmp(arg, "--is-inside-work-tree")) {
-				printf("%s\n", is_inside_work_tree() ? "true"
+				printf("%s\n", is_inside_work_tree(the_repository) ? "true"
 						: "false");
 				continue;
 			}
@@ -1167,7 +1184,7 @@ int cmd_rev_parse(int argc,
 		as_is = 1;
 		if (!show_file(arg, output_prefix))
 			continue;
-		verify_filename(prefix, arg, 1);
+		verify_filename(the_repository, prefix, arg, 1);
 	}
 	strbuf_release(&buf);
 	if (verify) {

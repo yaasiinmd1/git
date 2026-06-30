@@ -2,6 +2,7 @@
 #define HTTP_H
 
 struct packed_git;
+struct packfile_list;
 
 #include "git-zlib.h"
 
@@ -19,6 +20,7 @@ struct slot_results {
 	long http_code;
 	long auth_avail;
 	long http_connectcode;
+	long retry_after;
 };
 
 struct active_request_slot {
@@ -73,6 +75,12 @@ extern int active_requests;
 extern int http_is_verbose;
 extern ssize_t http_post_buffer;
 extern struct credential http_auth;
+
+/**
+ * Prepare for an HTTP re-authentication retry. This fills credentials
+ * via credential_fill() so the next request can include them.
+ */
+void http_reauth_prepare(int all_capabilities);
 
 extern char curl_errorstr[CURL_ERROR_SIZE];
 
@@ -156,6 +164,13 @@ struct http_get_options {
 	 * request has completed.
 	 */
 	struct string_list *extra_headers;
+
+	/*
+	 * After a request completes, contains the Retry-After delay in seconds
+	 * if the server returned HTTP 429 with a Retry-After header (requires
+	 * libcurl 7.66.0 or later), or -1 if no such header was present.
+	 */
+	long retry_after;
 };
 
 /* Return values for http_get_*() */
@@ -166,6 +181,7 @@ struct http_get_options {
 #define HTTP_REAUTH	4
 #define HTTP_NOAUTH	5
 #define HTTP_NOMATCHPUBLICKEY	6
+#define HTTP_RATE_LIMITED	7
 
 /*
  * Requests a URL and stores the result in a strbuf.
@@ -190,7 +206,7 @@ struct curl_slist *http_append_auth_header(const struct credential *c,
 
 /* Helpers for fetching packs */
 int http_get_info_packs(const char *base_url,
-			struct packed_git **packs_head);
+			struct packfile_list *packs);
 
 /* Helper for getting Accept-Language header */
 const char *http_get_accept_language_header(void);
@@ -226,7 +242,7 @@ void release_http_pack_request(struct http_pack_request *preq);
  * from http_get_info_packs() and have chosen a specific pack to fetch.
  */
 void http_install_packfile(struct packed_git *p,
-			   struct packed_git **list_to_remove_from);
+			   struct packfile_list *list_to_remove_from);
 
 /* Helpers for fetching object */
 struct http_object_request {

@@ -57,6 +57,8 @@ struct replay_opts {
 	int ignore_date;
 	int commit_use_reference;
 
+	struct strvec trailer_args;
+
 	int mainline;
 
 	char *gpg_sign;
@@ -84,6 +86,7 @@ struct replay_opts {
 #define REPLAY_OPTS_INIT {			\
 	.edit = -1,				\
 	.action = -1,				\
+	.trailer_args = STRVEC_INIT,		\
 	.xopts = STRVEC_INIT,			\
 	.ctx = replay_ctx_new(),		\
 }
@@ -226,12 +229,15 @@ void commit_post_rewrite(struct repository *r,
 			 const struct object_id *new_head);
 
 void create_autostash(struct repository *r, const char *path);
-void create_autostash_ref(struct repository *r, const char *refname);
+void create_autostash_ref(struct repository *r, const char *refname,
+			  const char *message, bool silent);
 int save_autostash(const char *path);
 int save_autostash_ref(struct repository *r, const char *refname);
 int apply_autostash(const char *path);
 int apply_autostash_oid(const char *stash_oid);
-int apply_autostash_ref(struct repository *r, const char *refname);
+int apply_autostash_ref(struct repository *r, const char *refname,
+			const char *label_ours, const char *label_theirs,
+			const char *label_base, const char *stash_msg);
 
 #define SUMMARY_INITIAL_COMMIT   (1 << 0)
 #define SUMMARY_SHOW_AUTHOR_DATE (1 << 1)
@@ -270,5 +276,18 @@ int sequencer_determine_whence(struct repository *r, enum commit_whence *whence)
  * Localized to a worktree's git dir.
  */
 int sequencer_get_update_refs_state(const char *wt_dir, struct string_list *refs);
+
+/*
+ * Format a revert commit message with appropriate 'Revert "<subject>"' or
+ * 'Reapply "<subject>"' prefix and 'This reverts commit <ref>.' body.
+ * When use_commit_reference is set, <ref> is an abbreviated hash with
+ * subject and date; otherwise the full hex hash is used.
+ */
+void sequencer_format_revert_message(struct repository *r,
+				     const char *subject,
+				     const struct commit *commit,
+				     const struct commit *parent,
+				     bool use_commit_reference,
+				     struct strbuf *message);
 
 #endif /* SEQUENCER_H */

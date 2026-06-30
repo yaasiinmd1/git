@@ -247,6 +247,12 @@ void string_list_sort(struct string_list *list)
 	QSORT_S(list->items, list->nr, cmp_items, &sort_ctx);
 }
 
+void string_list_sort_u(struct string_list *list, int free_util)
+{
+	string_list_sort(list);
+	string_list_remove_duplicates(list, free_util);
+}
+
 struct string_list_item *unsorted_string_list_lookup(struct string_list *list,
 						     const char *string)
 {
@@ -273,6 +279,15 @@ void unsorted_string_list_delete_item(struct string_list *list, int i, int free_
 		free(list->items[i].util);
 	list->items[i] = list->items[list->nr-1];
 	list->nr--;
+}
+
+void unsorted_string_list_remove(struct string_list *list, const char *str,
+				 int free_util)
+{
+	struct string_list_item *item = unsorted_string_list_lookup(list, str);
+	if (item)
+		unsorted_string_list_delete_item(list, item - list->items,
+						 free_util);
 }
 
 /*
@@ -327,7 +342,7 @@ static int split_string(struct string_list *list, const char *string, const char
 		BUG("string_list_split() called without strdup_strings");
 
 	for (;;) {
-		char *end;
+		const char *end;
 
 		if (flags & STRING_LIST_SPLIT_TRIM) {
 			/* ltrim */

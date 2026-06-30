@@ -15,6 +15,31 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see https://www.gnu.org/licenses/ .
 
+# Enable the use of errexit so that any unexpected failures will cause us to
+# abort tests, even when outside of a specific test case.
+#
+# Note that we only enable this on Bash 5 and newer, or when explicitly
+# requested by the user via `GIT_TEST_USE_SET_E=true`. This ib secause `set -e`
+# has wildly different behaviour across shells. The list of default-enabled
+# shells may be extended going forward.
+if test -z "$GIT_TEST_USE_SET_E" && test "${BASH_VERSINFO:=0}" -ge 5
+then
+	GIT_TEST_USE_SET_E=true
+fi
+
+# We cannot use `test-tool env-helper` here, as it's not yet available.
+case "${GIT_TEST_USE_SET_E:-false}" in
+1|on|true|yes)
+	set -e
+	;;
+0|off|false|no)
+	;;
+*)
+	echo "GIT_TEST_USE_SET_E requires a boolean" >&2
+	exit 1
+	;;
+esac
+
 # Test the binaries we have just built.  The tests are kept in
 # t/ subdirectory and are run in 'trash directory' subdirectory.
 if test -z "$TEST_DIRECTORY"
@@ -77,6 +102,7 @@ prepend_var GIT_SAN_OPTIONS : strip_path_prefix="$GIT_BUILD_DIR/"
 # want that one to complain to stderr).
 prepend_var ASAN_OPTIONS : $GIT_SAN_OPTIONS
 prepend_var ASAN_OPTIONS : detect_leaks=0
+prepend_var ASAN_OPTIONS : strict_string_checks=1
 export ASAN_OPTIONS
 
 prepend_var LSAN_OPTIONS : $GIT_SAN_OPTIONS
@@ -142,8 +168,8 @@ export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
 ################################################################
 # It appears that people try to run tests without building...
 GIT_BINARY="${GIT_TEST_INSTALLED:-$GIT_BUILD_DIR}/git$X"
-"$GIT_BINARY" >/dev/null
-if test $? != 1
+
+if ! "$GIT_BINARY" version >/dev/null
 then
 	if test -n "$GIT_TEST_INSTALLED"
 	then
@@ -453,8 +479,10 @@ then
 	# from any previous runs.
 	>"$GIT_TEST_TEE_OUTPUT_FILE"
 
-	(GIT_TEST_TEE_STARTED=done ${TEST_SHELL_PATH} "$0" "$@" 2>&1;
-	 echo $? >"$TEST_RESULTS_BASE.exit") | tee -a "$GIT_TEST_TEE_OUTPUT_FILE"
+	(
+		ret=0 && GIT_TEST_TEE_STARTED=done ${TEST_SHELL_PATH} "$0" "$@" 2>&1 || ret=$?
+		echo "$ret" >"$TEST_RESULTS_BASE.exit"
+	) | tee -a "$GIT_TEST_TEE_OUTPUT_FILE"
 	test "$(cat "$TEST_RESULTS_BASE.exit")" = 0
 	exit
 fi
@@ -1271,10 +1299,10 @@ test_done () {
 			error "Tests passed but trash directory already removed before test cleanup; aborting"
 
 			cd "$TRASH_DIRECTORY/.." &&
-			rm -fr "$TRASH_DIRECTORY" || {
+			rm -fr "$TRASH_DIRECTORY" 2>/dev/null || {
 				# try again in a bit
 				sleep 5;
-				rm -fr "$TRASH_DIRECTORY"
+				rm -fr "$TRASH_DIRECTORY" 2>/dev/null
 			} ||
 			error "Tests passed but test cleanup failed; aborting"
 		fi
@@ -1504,6 +1532,12 @@ then
 	BAIL_OUT 'You need to build test-tool; Run "make t/helper/test-tool" in the source (toplevel) directory'
 fi
 
+if test -n "$HARNESS_ACTIVE"
+then
+	say "TAP version 13"
+	say "pragma +strict"
+fi
+
 # Are we running this test at all?
 remove_trash=
 this_test=${0##*/}
@@ -1595,6 +1629,19 @@ fi
 cd -P "$TRASH_DIRECTORY" || BAIL_OUT "cannot cd -P to \"$TRASH_DIRECTORY\""
 TRASH_DIRECTORY=$(pwd)
 HOME="$TRASH_DIRECTORY"
+
+if test -n "$WITH_BREAKING_CHANGES"
+then
+	git config --global safe.bareRepository all &&
+	# Only write to .git/info/exclude when the directory exists
+	# (i.e. when git init created the repo). If we mkdir -p it
+	# ourselves, tests that expect to create .git/info/ themselves
+	# (e.g. t0008) would fail.
+	if test -d .git/info
+	then
+		echo "/.gitconfig" >>.git/info/exclude
+	fi
+fi
 
 start_test_output "$0"
 
@@ -1719,7 +1766,6 @@ esac
 ( COLUMNS=1 && test $COLUMNS = 1 ) && test_set_prereq COLUMNS_CAN_BE_1
 test -z "$NO_CURL" && test_set_prereq LIBCURL
 test -z "$NO_GITWEB" && test_set_prereq GITWEB
-test -z "$NO_ICONV" && test_set_prereq ICONV
 test -z "$NO_PERL" && test_set_prereq PERL
 test -z "$NO_PTHREADS" && test_set_prereq PTHREADS
 test -z "$NO_PYTHON" && test_set_prereq PYTHON
@@ -1729,6 +1775,17 @@ test -z "$NO_GETTEXT" && test_set_prereq GETTEXT
 test -n "$SANITIZE_LEAK" && test_set_prereq SANITIZE_LEAK
 test -n "$GIT_VALGRIND_ENABLED" && test_set_prereq VALGRIND
 test -n "$PERL_PATH" && test_set_prereq PERL_TEST_HELPERS
+
+test_lazy_prereq ICONV '
+	# We require Git to be built with iconv support, and we require the
+	# iconv binary to exist.
+	#
+	# NEEDSWORK: We might eventually want to split this up into two
+	# prerequisites: one for NO_ICONV, and one for the iconv(1) binary, as
+	# some tests only depend on either of these.
+	test -z "$NO_ICONV" &&
+	iconv -f utf8 -t utf8 </dev/null
+'
 
 if test -z "$GIT_TEST_CHECK_CACHE_TREE"
 then
@@ -1890,6 +1947,10 @@ test_lazy_prereq LONG_IS_64BIT '
 	test 8 -le "$(build_option sizeof-long)"
 '
 
+test_lazy_prereq RUST '
+	test "$(build_option rust)" = enabled
+'
+
 test_lazy_prereq TIME_IS_64BIT 'test-tool date is64bit'
 test_lazy_prereq TIME_T_IS_64BIT 'test-tool date time_t-is64bit'
 
@@ -1945,6 +2006,10 @@ test_lazy_prereq COMPAT_HASH '
 # to avoid errors.
 GIT_TEST_MAINT_SCHEDULER="none:exit 1"
 export GIT_TEST_MAINT_SCHEDULER
+
+# Ensure that tests cannot race with background maintenance by default.
+GIT_TEST_MAINT_AUTO_DETACH="false"
+export GIT_TEST_MAINT_AUTO_DETACH
 
 # Does this platform support `git fsmonitor--daemon`
 #

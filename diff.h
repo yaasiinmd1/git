@@ -294,9 +294,9 @@ struct diff_options {
 	enum git_colorbool use_color;
 
 	/* Number of context lines to generate in patch output. */
-	int context;
+	unsigned int context;
 
-	int interhunkcontext;
+	unsigned int interhunkcontext;
 
 	/* Affects the way detection logic for complete rewrites, renames and
 	 * copies.
@@ -331,9 +331,9 @@ struct diff_options {
 
 	int ita_invisible_in_index;
 /* white-space error highlighting */
-#define WSEH_NEW (1<<12)
-#define WSEH_CONTEXT (1<<13)
-#define WSEH_OLD (1<<14)
+#define WSEH_NEW        (1<<16)
+#define WSEH_CONTEXT    (1<<17)
+#define WSEH_OLD        (1<<18)
 	unsigned ws_error_highlight;
 	const char *prefix;
 	int prefix_length;
@@ -407,8 +407,6 @@ struct diff_options {
 	#define COLOR_MOVED_WS_ALLOW_INDENTATION_CHANGE (1<<5)
 	#define COLOR_MOVED_WS_ERROR (1<<0)
 	unsigned color_moved_ws_handling;
-
-	bool dry_run;
 
 	struct repository *repo;
 	struct strmap *additional_path_headers;
@@ -573,6 +571,11 @@ void diff_change(struct diff_options *,
 		 int old_oid_valid, int new_oid_valid,
 		 const char *fullpath,
 		 unsigned dirty_submodule1, unsigned dirty_submodule2);
+
+void diff_same(struct diff_options *,
+	       unsigned mode,
+	       const struct object_id *oid,
+	       const char *fullpath);
 
 struct diff_filepair *diff_unmerge(struct diff_options *, const char *path);
 

@@ -24,6 +24,7 @@ SYNOPSIS
 		   [(--reroll-count|-v) <n>]
 		   [--to=<email>] [--cc=<email>]
 		   [--[no-]cover-letter] [--quiet]
+		   [--commit-list-format=<format-spec>]
 		   [--[no-]encode-email-headers]
 		   [--no-notes | --notes[=<ref>]]
 		   [--interdiff=<previous>]
@@ -220,10 +221,9 @@ populated with placeholder text.
 	for generating the cover letter.
 
 --subject-prefix=<subject-prefix>::
-	Instead of the standard '[PATCH]' prefix in the subject
-	line, instead use '[<subject-prefix>]'. This can be used
-	to name a patch series, and can be combined with the
-	`--numbered` option.
+	Use '[<subject-prefix>]' instead of the standard '[PATCH]'
+	prefix in the subject line. This can be used to name a patch
+	series, and can be combined with the `--numbered` option.
 +
 The configuration variable `format.subjectPrefix` may also be used
 to configure a subject prefix to apply to a given repository for
@@ -282,11 +282,12 @@ e.g., `--rfc='-(WIP)'` results in "PATCH (WIP)".
 
 --from::
 --from=<ident>::
-	Use `ident` in the `From:` header of each commit email. If the
-	author ident of the commit is not textually identical to the
-	provided `ident`, place a `From:` header in the body of the
-	message with the original author. If no `ident` is given, use
-	the committer ident.
+	Use `ident` in the `From:` header of each email. In case of a
+	commit email, if the author ident of the commit is not textually
+	identical to the provided `ident`, place a `From:` header in the
+	body of the message with the original author. If no `ident` is
+	given, or if the option is not passed at all, use the ident of
+	the current committer.
 +
 Note that this option is only useful if you are actually sending the
 emails and want to identify yourself as the sender, but retain the
@@ -317,9 +318,21 @@ feeding the result to `git send-email`.
 
 --cover-letter::
 --no-cover-letter::
-	In addition to the patches, generate a cover letter file
-	containing the branch description, shortlog and the overall diffstat.  You can
-	fill in a description in the file before sending it out.
+	In addition to the patches, generate a cover letter file containing the
+	branch description, commit list and the overall diffstat.  You can fill
+	in a description in the file before sending it out.
+
+--commit-list-format=<format-spec>::
+	Specify the format in which to generate the commit list of the patch
+	series. The accepted values for format-spec are `shortlog`, `modern` or
+	a format-string prefixed with `log:`. E.g. `log: %s (%an)`.
+	`modern` is the same as `log:%w(72)[%(count)/%(total)] %s`.
+	The `log:` prefix can be omitted if the format-string has a `%` in it
+	(expecting that it is part of `%<placeholder>`).
+	Defaults to the `format.commitListFormat` configuration variable, if
+	set, or `shortlog`.
+	This option given from the command-line implies the use of
+	`--cover-letter` unless `--no-cover-letter` is given.
 
 --encode-email-headers::
 --no-encode-email-headers::
@@ -452,6 +465,7 @@ with configuration variables.
 	signOff = true
 	outputDirectory = <directory>
 	coverLetter = auto
+	commitListFormat = shortlog
 	coverFromDescription = auto
 ------------
 
@@ -797,6 +811,10 @@ Note that `format-patch` will omit merge commits from the output, even
 if they are part of the requested range. A simple "patch" does not
 include enough information for the receiving end to reproduce the same
 merge commit.
+
+=== PATCH APPLICATION
+
+include::format-patch-caveats.adoc[]
 
 SEE ALSO
 --------

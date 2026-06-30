@@ -208,7 +208,7 @@ test_expect_success 'rev-parse --show-object-format in repo' '
 '
 
 
-test_expect_success 'rev-parse --show-object-format in repo with compat mode' '
+test_expect_success RUST 'rev-parse --show-object-format in repo with compat mode' '
 	mkdir repo &&
 	(
 		sane_unset GIT_DEFAULT_HASH &&
@@ -331,6 +331,31 @@ test_expect_success 'rev-parse --bisect includes bad, excludes good' '
 	refs/bisect/bad-3
 	refs/bisect/bad-4
 	^refs/bisect/good-3
+	EOF
+
+	git rev-parse --symbolic-full-name --bisect >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'rev-parse --bisect works with alternate terms' '
+	test_commit_bulk 6 &&
+
+	git bisect start --term-old=known --term-new=curious &&
+
+	git update-ref refs/bisect/curious-1 HEAD~1 &&
+	git update-ref refs/bisect/bad HEAD~2 &&
+	git update-ref refs/bisect/curious-3 HEAD~3 &&
+	git update-ref refs/bisect/known-3 HEAD~3 &&
+	git update-ref refs/bisect/curious-4 HEAD~4 &&
+	git update-ref refs/bisect/good HEAD~4 &&
+
+	# Note: refs/bisect/bad and refs/bisect/goood should be ignored because this
+	# is a bisect with custom terms (known/curious)
+	cat >expect <<-EOF &&
+	refs/bisect/curious-1
+	refs/bisect/curious-3
+	refs/bisect/curious-4
+	^refs/bisect/known-3
 	EOF
 
 	git rev-parse --symbolic-full-name --bisect >actual &&

@@ -60,8 +60,8 @@ static int diff_suppress_blank_empty;
 static enum git_colorbool diff_use_color_default = GIT_COLOR_UNKNOWN;
 static int diff_color_moved_default;
 static int diff_color_moved_ws_default;
-static int diff_context_default = 3;
-static int diff_interhunk_context_default;
+static unsigned int diff_context_default = 3;
+static unsigned int diff_interhunk_context_default;
 static char *diff_word_regex_cfg;
 static struct external_diff external_diff_cfg;
 static char *diff_order_file_cfg;
@@ -382,16 +382,17 @@ int git_diff_ui_config(const char *var, const char *value,
 		return 0;
 	}
 	if (!strcmp(var, "diff.context")) {
-		diff_context_default = git_config_int(var, value, ctx->kvi);
-		if (diff_context_default < 0)
+		int val = git_config_int(var, value, ctx->kvi);
+		if (val < 0)
 			return -1;
+		diff_context_default = val;
 		return 0;
 	}
 	if (!strcmp(var, "diff.interhunkcontext")) {
-		diff_interhunk_context_default = git_config_int(var, value,
-								ctx->kvi);
-		if (diff_interhunk_context_default < 0)
+		int val = git_config_int(var, value, ctx->kvi);
+		if (val < 0)
 			return -1;
+		diff_interhunk_context_default = val;
 		return 0;
 	}
 	if (!strcmp(var, "diff.renames")) {
@@ -601,10 +602,57 @@ struct emit_callback {
 	int blank_at_eof_in_postimage;
 	int lno_in_preimage;
 	int lno_in_postimage;
+	int last_line_kind;
 	const char **label_path;
 	struct diff_words_data *diff_words;
 	struct diff_options *opt;
 	struct strbuf *header;
+};
+
+/*
+ * State for the line-range callback wrappers that sit between
+ * xdi_diff_outf() and fn_out_consume().  xdiff produces a normal,
+ * unfiltered diff; the wrappers intercept each hunk header and line,
+ * track post-image position, and forward only lines that fall within
+ * the requested ranges.  Contiguous in-range lines are collected into
+ * range hunks and flushed with a synthetic @@ header so that
+ * fn_out_consume() sees well-formed unified-diff fragments.
+ *
+ * Removal lines ('-') cannot be classified by post-image position, so
+ * they are buffered in pending_rm until the next '+' or ' ' line
+ * reveals whether they precede an in-range line (flush into range hunk) or
+ * an out-of-range line (discard).
+ */
+struct line_range_callback {
+	xdiff_emit_line_fn orig_line_fn;
+	void *orig_cb_data;
+	const struct range_set *ranges;	/* 0-based [start, end) */
+	unsigned int cur_range;		/* index into the range_set */
+
+	/* Post/pre-image line counters (1-based, set from hunk headers) */
+	long lno_post;
+	long lno_pre;
+
+	/*
+	 * Function name from most recent xdiff hunk header;
+	 * size matches struct func_line.buf in xdiff/xemit.c.
+	 */
+	char func[80];
+	long funclen;
+
+	/* Range hunk being accumulated for the current range */
+	struct strbuf rhunk;
+	long rhunk_old_begin, rhunk_old_count;
+	long rhunk_new_begin, rhunk_new_count;
+	int rhunk_active;
+	int rhunk_has_changes;		/* any '+' or '-' lines? */
+
+	/* Removal lines not yet known to be in-range */
+	struct strbuf pending_rm;
+	int pending_rm_count;
+	long pending_rm_pre_begin;	/* pre-image line of first pending */
+
+	int ret;			/* latched error from orig_line_fn */
 };
 
 static int count_lines(const char *data, int size)
@@ -796,21 +844,23 @@ enum diff_symbol {
 	DIFF_SYMBOL_CONTEXT_INCOMPLETE,
 	DIFF_SYMBOL_PLUS,
 	DIFF_SYMBOL_MINUS,
-	DIFF_SYMBOL_NO_LF_EOF,
 	DIFF_SYMBOL_CONTEXT_FRAGINFO,
 	DIFF_SYMBOL_CONTEXT_MARKER,
 	DIFF_SYMBOL_SEPARATOR
 };
+
 /*
  * Flags for content lines:
- * 0..12 are whitespace rules
- * 13-15 are WSEH_NEW | WSEH_OLD | WSEH_CONTEXT
- * 16 is marking if the line is blank at EOF
+ * 0..15 are whitespace rules (see ws.h)
+ * 16..18 are WSEH_NEW | WSEH_CONTEXT | WSEH_OLD
+ * 19 is marking if the line is blank at EOF
+ * 20..22 are used for color-moved.
  */
-#define DIFF_SYMBOL_CONTENT_BLANK_LINE_EOF	(1<<16)
-#define DIFF_SYMBOL_MOVED_LINE			(1<<17)
-#define DIFF_SYMBOL_MOVED_LINE_ALT		(1<<18)
-#define DIFF_SYMBOL_MOVED_LINE_UNINTERESTING	(1<<19)
+#define DIFF_SYMBOL_CONTENT_BLANK_LINE_EOF	(1<<19)
+#define DIFF_SYMBOL_MOVED_LINE			(1<<20)
+#define DIFF_SYMBOL_MOVED_LINE_ALT		(1<<21)
+#define DIFF_SYMBOL_MOVED_LINE_UNINTERESTING	(1<<22)
+
 #define DIFF_SYMBOL_CONTENT_WS_MASK (WSEH_NEW | WSEH_OLD | WSEH_CONTEXT | WS_RULE_MASK)
 
 /*
@@ -1318,20 +1368,25 @@ static void emit_line_ws_markup(struct diff_options *o,
 	const char *ws = NULL;
 	int sign = o->output_indicators[sign_index];
 
+	if (diff_suppress_blank_empty &&
+	    sign_index == OUTPUT_INDICATOR_CONTEXT &&
+	    len == 1 && line[0] == '\n')
+		sign = 0;
+
 	if (o->ws_error_highlight & ws_rule) {
 		ws = diff_get_color_opt(o, DIFF_WHITESPACE);
 		if (!*ws)
 			ws = NULL;
 	}
 
-	if (!ws && !set_sign)
+	if (!ws && !set_sign) {
 		emit_line_0(o, set, NULL, 0, reset, sign, line, len);
-	else if (!ws) {
+	} else if (!ws) {
 		emit_line_0(o, set_sign, set, !!set_sign, reset, sign, line, len);
-	} else if (blank_at_eof)
+	} else if (blank_at_eof) {
 		/* Blank line at EOF - paint '+' as well */
 		emit_line_0(o, ws, NULL, 0, reset, sign, line, len);
-	else {
+	} else {
 		/* Emit just the prefix, then the rest. */
 		emit_line_0(o, set_sign ? set_sign : set, NULL, !!set_sign, reset,
 			    sign, "", 0);
@@ -1343,7 +1398,6 @@ static void emit_line_ws_markup(struct diff_options *o,
 static void emit_diff_symbol_from_struct(struct diff_options *o,
 					 struct emitted_diff_symbol *eds)
 {
-	static const char *nneof = " No newline at end of file\n";
 	const char *context, *reset, *set, *set_sign, *meta, *fraginfo;
 
 	enum diff_symbol s = eds->s;
@@ -1351,17 +1405,10 @@ static void emit_diff_symbol_from_struct(struct diff_options *o,
 	int len = eds->len;
 	unsigned flags = eds->flags;
 
-	if (o->dry_run)
+	if (!o->file)
 		return;
 
 	switch (s) {
-	case DIFF_SYMBOL_NO_LF_EOF:
-		context = diff_get_color_opt(o, DIFF_CONTEXT);
-		reset = diff_get_color_opt(o, DIFF_RESET);
-		putc('\n', o->file);
-		emit_line_0(o, context, NULL, 0, reset, '\\',
-			    nneof, strlen(nneof));
-		break;
 	case DIFF_SYMBOL_SUBMODULE_HEADER:
 	case DIFF_SYMBOL_SUBMODULE_ERROR:
 	case DIFF_SYMBOL_SUBMODULE_PIPETHROUGH:
@@ -1373,6 +1420,14 @@ static void emit_diff_symbol_from_struct(struct diff_options *o,
 		emit_line(o, "", "", line, len);
 		break;
 	case DIFF_SYMBOL_CONTEXT_INCOMPLETE:
+		if ((flags & WS_INCOMPLETE_LINE) &&
+		    (flags & o->ws_error_highlight))
+			set = diff_get_color_opt(o, DIFF_WHITESPACE);
+		else
+			set = diff_get_color_opt(o, DIFF_CONTEXT);
+		reset = diff_get_color_opt(o, DIFF_RESET);
+		emit_line(o, set, reset, line, len);
+		break;
 	case DIFF_SYMBOL_CONTEXT_MARKER:
 		context = diff_get_color_opt(o, DIFF_CONTEXT);
 		reset = diff_get_color_opt(o, DIFF_RESET);
@@ -1498,15 +1553,9 @@ static void emit_diff_symbol_from_struct(struct diff_options *o,
 	case DIFF_SYMBOL_WORDS:
 		context = diff_get_color_opt(o, DIFF_CONTEXT);
 		reset = diff_get_color_opt(o, DIFF_RESET);
-		/*
-		 * Skip the prefix character, if any.  With
-		 * diff_suppress_blank_empty, there may be
-		 * none.
-		 */
-		if (line[0] != '\n') {
-			line++;
-			len--;
-		}
+
+		/* Skip the prefix character */
+		line++; len--;
 		emit_line(o, context, reset, line, len);
 		break;
 	case DIFF_SYMBOL_FILEPAIR_PLUS:
@@ -1668,6 +1717,19 @@ static void emit_context_line(struct emit_callback *ecbdata,
 	emit_diff_symbol(ecbdata->opt, DIFF_SYMBOL_CONTEXT, line, len, flags);
 }
 
+static void emit_incomplete_line_marker(struct emit_callback *ecbdata,
+					const char *line, int len)
+{
+	int last_line_kind = ecbdata->last_line_kind;
+	unsigned flags = (last_line_kind == '+'
+			  ? WSEH_NEW
+			  : last_line_kind == '-'
+			  ? WSEH_OLD
+			  : WSEH_CONTEXT) | ecbdata->ws_rule;
+	emit_diff_symbol(ecbdata->opt, DIFF_SYMBOL_CONTEXT_INCOMPLETE,
+			 line, len, flags);
+}
+
 static void emit_hunk_header(struct emit_callback *ecbdata,
 			     const char *line, int len)
 {
@@ -1769,28 +1831,44 @@ static void add_line_count(struct strbuf *out, int count)
 	}
 }
 
-static void emit_rewrite_lines(struct emit_callback *ecb,
+static void emit_rewrite_lines(struct emit_callback *ecbdata,
 			       int prefix, const char *data, int size)
 {
 	const char *endp = NULL;
 
 	while (0 < size) {
-		int len;
+		int len, plen;
+		char *pdata = NULL;
 
 		endp = memchr(data, '\n', size);
-		len = endp ? (endp - data + 1) : size;
-		if (prefix != '+') {
-			ecb->lno_in_preimage++;
-			emit_del_line(ecb, data, len);
+
+		if (endp) {
+			len = endp - data + 1;
+			plen = len;
 		} else {
-			ecb->lno_in_postimage++;
-			emit_add_line(ecb, data, len);
+			len = size;
+			plen = len + 1;
+			pdata = xmalloc(plen + 2);
+			memcpy(pdata, data, len);
+			pdata[len] = '\n';
+			pdata[len + 1] = '\0';
 		}
+		if (prefix != '+') {
+			ecbdata->lno_in_preimage++;
+			emit_del_line(ecbdata, pdata ? pdata : data, plen);
+		} else {
+			ecbdata->lno_in_postimage++;
+			emit_add_line(ecbdata, pdata ? pdata : data, plen);
+		}
+		free(pdata);
 		size -= len;
 		data += len;
 	}
-	if (!endp)
-		emit_diff_symbol(ecb->opt, DIFF_SYMBOL_NO_LF_EOF, NULL, 0, 0);
+	if (!endp) {
+		static const char nneof[] = "\\ No newline at end of file\n";
+		ecbdata->last_line_kind = prefix;
+		emit_incomplete_line_marker(ecbdata, nneof, sizeof(nneof) - 1);
+	}
 }
 
 static void emit_rewrite_diff(const char *name_a,
@@ -1806,6 +1884,7 @@ static void emit_rewrite_diff(const char *name_a,
 	const char *a_prefix, *b_prefix;
 	char *data_one, *data_two;
 	size_t size_one, size_two;
+	unsigned ws_rule;
 	struct emit_callback ecbdata;
 	struct strbuf out = STRBUF_INIT;
 
@@ -1828,9 +1907,15 @@ static void emit_rewrite_diff(const char *name_a,
 	size_one = fill_textconv(o->repo, textconv_one, one, &data_one);
 	size_two = fill_textconv(o->repo, textconv_two, two, &data_two);
 
+	ws_rule = whitespace_rule(o->repo->index, name_b);
+
+	/* symlink being an incomplete line is not a news */
+	if (DIFF_FILE_VALID(two) && S_ISLNK(two->mode))
+		ws_rule &= ~WS_INCOMPLETE_LINE;
+
 	memset(&ecbdata, 0, sizeof(ecbdata));
 	ecbdata.color_diff = o->use_color;
-	ecbdata.ws_rule = whitespace_rule(o->repo->index, name_b);
+	ecbdata.ws_rule = ws_rule;
 	ecbdata.opt = o;
 	if (ecbdata.ws_rule & WS_BLANK_AT_EOF) {
 		mmfile_t mf1, mf2;
@@ -1930,7 +2015,7 @@ static int fn_out_diff_words_write_helper(struct diff_options *o,
 	struct strbuf sb = STRBUF_INIT;
 
 	while (count) {
-		char *p = memchr(buf, '\n', count);
+		const char *p = memchr(buf, '\n', count);
 		if (print)
 			strbuf_addstr(&sb, diff_line_prefix(o));
 
@@ -2375,12 +2460,6 @@ static int fn_out_consume(void *priv, char *line, unsigned long len)
 		ecbdata->label_path[0] = ecbdata->label_path[1] = NULL;
 	}
 
-	if (diff_suppress_blank_empty
-	    && len == 2 && line[0] == ' ' && line[1] == '\n') {
-		line[0] = '\n';
-		len = 1;
-	}
-
 	if (line[0] == '@') {
 		if (ecbdata->diff_words)
 			diff_words_flush(ecbdata);
@@ -2431,13 +2510,24 @@ static int fn_out_consume(void *priv, char *line, unsigned long len)
 		ecbdata->lno_in_preimage++;
 		emit_context_line(ecbdata, line + 1, len - 1);
 		break;
-	default:
+	case '\\':
 		/* incomplete line at the end */
+		switch (ecbdata->last_line_kind) {
+		case '+':
+		case '-':
+		case ' ':
+			break;
+		default:
+			BUG("fn_out_consume: '\\No newline' after unknown line (%c)",
+			    ecbdata->last_line_kind);
+		}
 		ecbdata->lno_in_preimage++;
-		emit_diff_symbol(o, DIFF_SYMBOL_CONTEXT_INCOMPLETE,
-				 line, len, 0);
+		emit_incomplete_line_marker(ecbdata, line, len);
 		break;
+	default:
+		BUG("fn_out_consume: unknown line '%s'", line);
 	}
+	ecbdata->last_line_kind = line[0];
 	return 0;
 }
 
@@ -2448,6 +2538,188 @@ static int quick_consume(void *priv, char *line UNUSED, unsigned long len UNUSED
 
 	o->found_changes = 1;
 	return 1;
+}
+
+static void discard_pending_rm(struct line_range_callback *s)
+{
+	strbuf_reset(&s->pending_rm);
+	s->pending_rm_count = 0;
+}
+
+static void flush_rhunk(struct line_range_callback *s)
+{
+	struct strbuf hdr = STRBUF_INIT;
+	const char *p, *end;
+
+	if (!s->rhunk_active || s->ret)
+		return;
+
+	/* Drain any pending removal lines into the range hunk */
+	if (s->pending_rm_count) {
+		strbuf_addbuf(&s->rhunk, &s->pending_rm);
+		s->rhunk_old_count += s->pending_rm_count;
+		s->rhunk_has_changes = 1;
+		discard_pending_rm(s);
+	}
+
+	/*
+	 * Suppress context-only hunks: they contain no actual changes
+	 * and would just be noise.  This can happen when the inflated
+	 * ctxlen causes xdiff to emit context covering a range that
+	 * has no changes in this commit.
+	 */
+	if (!s->rhunk_has_changes) {
+		s->rhunk_active = 0;
+		strbuf_reset(&s->rhunk);
+		return;
+	}
+
+	strbuf_addf(&hdr, "@@ -%ld,%ld +%ld,%ld @@",
+		    s->rhunk_old_begin, s->rhunk_old_count,
+		    s->rhunk_new_begin, s->rhunk_new_count);
+	if (s->funclen > 0) {
+		strbuf_addch(&hdr, ' ');
+		strbuf_add(&hdr, s->func, s->funclen);
+	}
+	strbuf_addch(&hdr, '\n');
+
+	s->ret = s->orig_line_fn(s->orig_cb_data, hdr.buf, hdr.len);
+	strbuf_release(&hdr);
+
+	/*
+	 * Replay buffered lines one at a time through fn_out_consume.
+	 * The cast discards const because xdiff_emit_line_fn takes
+	 * char *, though fn_out_consume does not modify the buffer.
+	 */
+	p = s->rhunk.buf;
+	end = p + s->rhunk.len;
+	while (!s->ret && p < end) {
+		const char *eol = memchr(p, '\n', end - p);
+		unsigned long line_len = eol ? (unsigned long)(eol - p + 1)
+					     : (unsigned long)(end - p);
+		s->ret = s->orig_line_fn(s->orig_cb_data, (char *)p, line_len);
+		p += line_len;
+	}
+
+	s->rhunk_active = 0;
+	strbuf_reset(&s->rhunk);
+}
+
+static void line_range_hunk_fn(void *data,
+			       long old_begin, long old_nr UNUSED,
+			       long new_begin, long new_nr UNUSED,
+			       const char *func, long funclen)
+{
+	struct line_range_callback *s = data;
+
+	/*
+	 * When count > 0, begin is 1-based.  When count == 0, begin is
+	 * adjusted down by 1 by xdl_emit_hunk_hdr(), but no lines of
+	 * that type will arrive, so the value is unused.
+	 *
+	 * Any pending removal lines from the previous xdiff hunk are
+	 * intentionally left in pending_rm: the line callback will
+	 * flush or discard them when the next content line reveals
+	 * whether the removals precede in-range content.
+	 */
+	s->lno_post = new_begin;
+	s->lno_pre = old_begin;
+
+	if (funclen > 0) {
+		if (funclen > (long)sizeof(s->func))
+			funclen = sizeof(s->func);
+		memcpy(s->func, func, funclen);
+	}
+	s->funclen = funclen;
+}
+
+static int line_range_line_fn(void *priv, char *line, unsigned long len)
+{
+	struct line_range_callback *s = priv;
+	const struct range *cur;
+	long lno_0, cur_pre;
+
+	if (s->ret)
+		return s->ret;
+
+	if (line[0] == '-') {
+		if (!s->pending_rm_count)
+			s->pending_rm_pre_begin = s->lno_pre;
+		s->lno_pre++;
+		strbuf_add(&s->pending_rm, line, len);
+		s->pending_rm_count++;
+		return s->ret;
+	}
+
+	if (line[0] == '\\') {
+		if (s->pending_rm_count)
+			strbuf_add(&s->pending_rm, line, len);
+		else if (s->rhunk_active)
+			strbuf_add(&s->rhunk, line, len);
+		/* otherwise outside tracked range; drop silently */
+		return s->ret;
+	}
+
+	if (line[0] != '+' && line[0] != ' ')
+		BUG("unexpected diff line type '%c'", line[0]);
+
+	lno_0 = s->lno_post - 1;
+	cur_pre = s->lno_pre;	/* save before advancing for context lines */
+	s->lno_post++;
+	if (line[0] == ' ')
+		s->lno_pre++;
+
+	/* Advance past ranges we've passed */
+	while (s->cur_range < s->ranges->nr &&
+	       lno_0 >= s->ranges->ranges[s->cur_range].end) {
+		if (s->rhunk_active)
+			flush_rhunk(s);
+		discard_pending_rm(s);
+		s->cur_range++;
+	}
+
+	/* Past all ranges */
+	if (s->cur_range >= s->ranges->nr) {
+		discard_pending_rm(s);
+		return s->ret;
+	}
+
+	cur = &s->ranges->ranges[s->cur_range];
+
+	/* Before current range */
+	if (lno_0 < cur->start) {
+		discard_pending_rm(s);
+		return s->ret;
+	}
+
+	/* In range so start a new range hunk if needed */
+	if (!s->rhunk_active) {
+		s->rhunk_active = 1;
+		s->rhunk_has_changes = 0;
+		s->rhunk_new_begin = lno_0 + 1;
+		s->rhunk_old_begin = s->pending_rm_count
+			? s->pending_rm_pre_begin : cur_pre;
+		s->rhunk_old_count = 0;
+		s->rhunk_new_count = 0;
+		strbuf_reset(&s->rhunk);
+	}
+
+	/* Flush pending removals into range hunk */
+	if (s->pending_rm_count) {
+		strbuf_addbuf(&s->rhunk, &s->pending_rm);
+		s->rhunk_old_count += s->pending_rm_count;
+		s->rhunk_has_changes = 1;
+		discard_pending_rm(s);
+	}
+
+	strbuf_add(&s->rhunk, line, len);
+	s->rhunk_new_count++;
+	if (line[0] == '+')
+		s->rhunk_has_changes = 1;
+	else
+		s->rhunk_old_count++;
+
+	return s->ret;
 }
 
 static void pprint_rename(struct strbuf *name, const char *a, const char *b)
@@ -2656,6 +2928,28 @@ void print_stat_summary(FILE *fp, int files,
 	print_stat_summary_inserts_deletes(&o, files, insertions, deletions);
 }
 
+/*
+ * Like utf8_width(), but guaranteed safe for use in loops that subtract
+ * per-character widths:
+ *
+ *   - utf8_width() sets *start to NULL on invalid UTF-8 and returns 0;
+ *     we restore the pointer and advance by one byte, returning width 1
+ *     (matching the strlen()-based fallback in utf8_strwidth()).
+ *
+ *   - utf8_width() returns -1 for control characters; we return 0
+ *     (matching utf8_strnwidth() which skips them).
+ */
+static int utf8_ish_width(const char **start)
+{
+	const char *old = *start;
+	int w = utf8_width(start, NULL);
+	if (!*start) {
+		*start = old + 1;
+		return 1;
+	}
+	return (w < 0) ? 0 : w;
+}
+
 static void show_stats(struct diffstat_t *data, struct diff_options *options)
 {
 	int i, len, add, del, adds = 0, dels = 0;
@@ -2713,7 +3007,9 @@ static void show_stats(struct diffstat_t *data, struct diff_options *options)
 	count = i; /* where we can stop scanning in data->files[] */
 
 	/*
-	 * We have width = stat_width or term_columns() columns total.
+	 * We have width = stat_width or term_columns() columns total minus the
+	 * length of line_prefix skipping ANSI escape codes to get the display
+	 * width (e.g., skip ANSI-colored strings in "log --graph --stat").
 	 * We want a maximum of min(max_len, stat_name_width) for the name part.
 	 * We want a maximum of min(max_change, stat_graph_width) for the +- part.
 	 * We also need 1 for " " and 4 + decimal_width(max_change)
@@ -2740,14 +3036,8 @@ static void show_stats(struct diffstat_t *data, struct diff_options *options)
 	 * separators and this message, this message will "overflow"
 	 * making the line longer than the maximum width.
 	 */
-
-	/*
-	 * NEEDSWORK: line_prefix is often used for "log --graph" output
-	 * and contains ANSI-colored string.  utf8_strnwidth() should be
-	 * used to correctly count the display width instead of strlen().
-	 */
 	if (options->stat_width == -1)
-		width = term_columns() - strlen(line_prefix);
+		width = term_columns() - utf8_strnwidth(line_prefix, strlen(line_prefix), 1);
 	else
 		width = options->stat_width ? options->stat_width : 80;
 	number_width = decimal_width(max_change) > number_width ?
@@ -2823,17 +3113,12 @@ static void show_stats(struct diffstat_t *data, struct diff_options *options)
 			char *slash;
 			prefix = "...";
 			len -= 3;
-			/*
-			 * NEEDSWORK: (name_len - len) counts the display
-			 * width, which would be shorter than the byte
-			 * length of the corresponding substring.
-			 * Advancing "name" by that number of bytes does
-			 * *NOT* skip over that many columns, so it is
-			 * very likely that chomping the pathname at the
-			 * slash we will find starting from "name" will
-			 * leave the resulting string still too long.
-			 */
-			name += name_len - len;
+			if (len < 0)
+				len = 0;
+
+			while (name_len > len && *name)
+				name_len -= utf8_ish_width((const char**)&name);
+
 			slash = strchr(name, '/');
 			if (slash)
 				name = slash;
@@ -3013,7 +3298,7 @@ static long gather_dirstat(struct diff_options *opt, struct dirstat_dir *dir,
 		struct dirstat_file *f = dir->files;
 		int namelen = strlen(f->name);
 		unsigned long changes;
-		char *slash;
+		const char *slash;
 
 		if (namelen < baselen)
 			break;
@@ -3231,6 +3516,7 @@ struct checkdiff_t {
 	struct diff_options *o;
 	unsigned ws_rule;
 	unsigned status;
+	int last_line_kind;
 };
 
 static int is_conflict_marker(const char *line, int marker_size, unsigned long len)
@@ -3269,6 +3555,7 @@ static void checkdiff_consume_hunk(void *priv,
 static int checkdiff_consume(void *priv, char *line, unsigned long len)
 {
 	struct checkdiff_t *data = priv;
+	int last_line_kind;
 	int marker_size = data->conflict_marker_size;
 	const char *ws = diff_get_color(data->o->use_color, DIFF_WHITESPACE);
 	const char *reset = diff_get_color(data->o->use_color, DIFF_RESET);
@@ -3279,6 +3566,8 @@ static int checkdiff_consume(void *priv, char *line, unsigned long len)
 	assert(data->o);
 	line_prefix = diff_line_prefix(data->o);
 
+	last_line_kind = data->last_line_kind;
+	data->last_line_kind = line[0];
 	if (line[0] == '+') {
 		unsigned bad;
 		data->lineno++;
@@ -3301,6 +3590,17 @@ static int checkdiff_consume(void *priv, char *line, unsigned long len)
 			      data->o->file, set, reset, ws);
 	} else if (line[0] == ' ') {
 		data->lineno++;
+	} else if (line[0] == '\\') {
+		/* no newline at the end of the line */
+		if ((data->ws_rule & WS_INCOMPLETE_LINE) &&
+		    (last_line_kind == '+')) {
+			unsigned bad = WS_INCOMPLETE_LINE;
+			data->status |= bad;
+			err = whitespace_error_string(bad);
+			fprintf(data->o->file, "%s%s:%d: %s.\n",
+				line_prefix, data->filename, data->lineno, err);
+			free(err);
+		}
 	}
 	return 0;
 }
@@ -3312,8 +3612,9 @@ static unsigned char *deflate_it(char *data,
 	int bound;
 	unsigned char *deflated;
 	git_zstream stream;
+	struct repo_config_values *cfg = repo_config_values(the_repository);
 
-	git_deflate_init(&stream, zlib_compression_level);
+	git_deflate_init(&stream, cfg->zlib_compression_level);
 	bound = git_deflate_bound(&stream, size);
 	deflated = xmalloc(bound);
 	stream.next_out = deflated;
@@ -3530,7 +3831,6 @@ static int set_diff_algorithm(struct diff_options *opts,
 		return -1;
 
 	/* clear out previous settings */
-	DIFF_XDL_CLR(opts, NEED_MINIMAL);
 	opts->xdl_opts &= ~XDF_DIFF_ALGORITHM_MASK;
 	opts->xdl_opts |= value;
 
@@ -3544,7 +3844,8 @@ static void builtin_diff(const char *name_a,
 			 const char *xfrm_msg,
 			 int must_show_header,
 			 struct diff_options *o,
-			 int complete_rewrite)
+			 int complete_rewrite,
+			 const struct range_set *line_ranges)
 {
 	mmfile_t mf1, mf2;
 	const char *lbl[2];
@@ -3714,6 +4015,7 @@ static void builtin_diff(const char *name_a,
 		xpparam_t xpp;
 		xdemitconf_t xecfg;
 		struct emit_callback ecbdata;
+		unsigned ws_rule;
 		const struct userdiff_funcname *pe;
 
 		if (must_show_header) {
@@ -3724,6 +4026,12 @@ static void builtin_diff(const char *name_a,
 
 		mf1.size = fill_textconv(o->repo, textconv_one, one, &mf1.ptr);
 		mf2.size = fill_textconv(o->repo, textconv_two, two, &mf2.ptr);
+
+		ws_rule = whitespace_rule(o->repo->index, name_b);
+
+		/* symlink being an incomplete line is not a news */
+		if (DIFF_FILE_VALID(two) && S_ISLNK(two->mode))
+			ws_rule &= ~WS_INCOMPLETE_LINE;
 
 		pe = diff_funcname_pattern(o, one);
 		if (!pe)
@@ -3736,7 +4044,7 @@ static void builtin_diff(const char *name_a,
 			lbl[0] = NULL;
 		ecbdata.label_path = lbl;
 		ecbdata.color_diff = o->use_color;
-		ecbdata.ws_rule = whitespace_rule(o->repo->index, name_b);
+		ecbdata.ws_rule = ws_rule;
 		if (ecbdata.ws_rule & WS_BLANK_AT_EOF)
 			check_blank_at_eof(&mf1, &mf2, &ecbdata);
 		ecbdata.opt = o;
@@ -3765,9 +4073,9 @@ static void builtin_diff(const char *name_a,
 
 		if (o->word_diff)
 			init_diff_words_data(&ecbdata, o, one, two);
-		if (o->dry_run) {
+		if (!o->file) {
 			/*
-			 * Unlike the !dry_run case, we need to ignore the
+			 * Unlike the normal output case, we need to ignore the
 			 * return value from xdi_diff_outf() here, because
 			 * xdi_diff_outf() takes non-zero return from its
 			 * callback function as a sign of error and returns
@@ -3778,6 +4086,52 @@ static void builtin_diff(const char *name_a,
 			 */
 			xdi_diff_outf(&mf1, &mf2, NULL, quick_consume,
 				      &ecbdata, &xpp, &xecfg);
+		} else if (line_ranges) {
+			struct line_range_callback lr_state;
+			unsigned int i;
+			long max_span = 0;
+
+			memset(&lr_state, 0, sizeof(lr_state));
+			lr_state.orig_line_fn = fn_out_consume;
+			lr_state.orig_cb_data = &ecbdata;
+			lr_state.ranges = line_ranges;
+			strbuf_init(&lr_state.rhunk, 0);
+			strbuf_init(&lr_state.pending_rm, 0);
+
+			/*
+			 * Inflate ctxlen so that all changes within
+			 * any single range are merged into one xdiff
+			 * hunk and the inter-change context is emitted.
+			 * The callback clips back to range boundaries.
+			 *
+			 * The optimal ctxlen depends on where changes
+			 * fall within the range, which is only known
+			 * after xdiff runs; the max range span is the
+			 * upper bound that guarantees correctness in a
+			 * single pass.
+			 */
+			for (i = 0; i < line_ranges->nr; i++) {
+				long span = line_ranges->ranges[i].end -
+					    line_ranges->ranges[i].start;
+				if (span > max_span)
+					max_span = span;
+			}
+			if (max_span > xecfg.ctxlen)
+				xecfg.ctxlen = max_span;
+
+			if (xdi_diff_outf(&mf1, &mf2,
+					  line_range_hunk_fn,
+					  line_range_line_fn,
+					  &lr_state, &xpp, &xecfg))
+				die("unable to generate diff for %s",
+				    one->path);
+
+			flush_rhunk(&lr_state);
+			if (lr_state.ret)
+				die("unable to generate diff for %s",
+				    one->path);
+			strbuf_release(&lr_state.rhunk);
+			strbuf_release(&lr_state.pending_rm);
 		} else if (xdi_diff_outf(&mf1, &mf2, NULL, fn_out_consume,
 					 &ecbdata, &xpp, &xecfg))
 			die("unable to generate diff for %s", one->path);
@@ -3942,6 +4296,10 @@ static void builtin_checkdiff(const char *name_a, const char *name_b,
 	data.o = o;
 	data.ws_rule = whitespace_rule(o->repo->index, attr_path);
 	data.conflict_marker_size = ll_merge_marker_size(o->repo->index, attr_path);
+
+	/* symlink being an incomplete line is not a news */
+	if (DIFF_FILE_VALID(two) && S_ISLNK(two->mode))
+		data.ws_rule &= ~WS_INCOMPLETE_LINE;
 
 	if (fill_mmfile(o->repo, &mf1, one) < 0 ||
 	    fill_mmfile(o->repo, &mf2, two) < 0)
@@ -4237,8 +4595,9 @@ int diff_populate_filespec(struct repository *r,
 		}
 	}
 	else {
+		size_t size_st = 0;
 		struct object_info info = {
-			.sizep = &s->size
+			.sizep = &size_st
 		};
 
 		if (!(size_only || check_binary))
@@ -4260,6 +4619,7 @@ int diff_populate_filespec(struct repository *r,
 			die("unable to read %s", oid_to_hex(&s->oid));
 
 object_read:
+		s->size = cast_size_t_to_ulong(size_st);
 		if (size_only || check_binary) {
 			if (size_only)
 				return 0;
@@ -4274,6 +4634,7 @@ object_read:
 			if (odb_read_object_info_extended(r->objects, &s->oid, &info,
 							  OBJECT_INFO_LOOKUP_REPLACE))
 				die("unable to read %s", oid_to_hex(&s->oid));
+			s->size = cast_size_t_to_ulong(size_st);
 		}
 		s->should_free = 1;
 	}
@@ -4423,7 +4784,6 @@ static void run_external_diff(const struct external_diff *pgm,
 {
 	struct child_process cmd = CHILD_PROCESS_INIT;
 	struct diff_queue_struct *q = &diff_queued_diff;
-	int quiet = !(o->output_format & DIFF_FORMAT_PATCH) || o->dry_run;
 	int rc;
 
 	/*
@@ -4432,7 +4792,7 @@ static void run_external_diff(const struct external_diff *pgm,
 	 * external diff program lacks the ability to tell us whether
 	 * it's empty then we consider it non-empty without even asking.
 	 */
-	if (!pgm->trust_exit_code && quiet) {
+	if (!pgm->trust_exit_code && !o->file) {
 		o->found_changes = 1;
 		return;
 	}
@@ -4457,7 +4817,10 @@ static void run_external_diff(const struct external_diff *pgm,
 	diff_free_filespec_data(one);
 	diff_free_filespec_data(two);
 	cmd.use_shell = 1;
-	cmd.no_stdout = quiet;
+	if (!o->file)
+		cmd.no_stdout = 1;
+	else if (o->file != stdout)
+		cmd.out = xdup(fileno(o->file));
 	rc = run_command(&cmd);
 	if (!pgm->trust_exit_code && rc == 0)
 		o->found_changes = 1;
@@ -4613,12 +4976,12 @@ static void run_diff_cmd(const struct external_diff *pgm,
 
 		builtin_diff(name, other ? other : name,
 			     one, two, xfrm_msg, must_show_header,
-			     o, complete_rewrite);
+			     o, complete_rewrite, p->line_ranges);
 		if (p->status == DIFF_STATUS_COPIED ||
 		    p->status == DIFF_STATUS_RENAMED)
 			o->found_changes = 1;
 	} else {
-		if (!o->dry_run)
+		if (o->file)
 			fprintf(o->file, "* Unmerged path %s\n", name);
 		o->found_changes = 1;
 	}
@@ -4985,6 +5348,8 @@ void diff_setup_done(struct diff_options *options)
 	if (options->flags.quick) {
 		options->output_format = DIFF_FORMAT_NO_OUTPUT;
 		options->flags.exit_with_status = 1;
+		options->detect_rename = 0;
+		options->flags.find_copies_harder = 0;
 	}
 
 	/*
@@ -5161,6 +5526,8 @@ static int diff_opt_find_object(const struct option *option,
 	struct object_id oid;
 
 	BUG_ON_OPT_NEG(unset);
+	if (!startup_info->have_repository)
+		return error(_("--find-object requires a git repository"));
 	if (repo_get_oid(the_repository, arg, &oid))
 		return error(_("unable to resolve '%s'"), arg);
 
@@ -5584,9 +5951,12 @@ static int diff_opt_unified(const struct option *opt,
 	BUG_ON_OPT_NEG(unset);
 
 	if (arg) {
-		options->context = strtol(arg, &s, 10);
+		long val = strtol(arg, &s, 10);
 		if (*s)
 			return error(_("%s expects a numerical value"), "--unified");
+		if (val < 0)
+			return error(_("%s expects a non-negative integer"), "--unified");
+		options->context = val;
 	}
 	enable_patch_output(&options->output_format);
 
@@ -5771,9 +6141,8 @@ struct option *add_diff_options(const struct option *opts,
 		OPT_CALLBACK_F(0, "default-prefix", options, NULL,
 			       N_("use default prefixes a/ and b/"),
 			       PARSE_OPT_NONEG | PARSE_OPT_NOARG, diff_opt_default_prefix),
-		OPT_INTEGER_F(0, "inter-hunk-context", &options->interhunkcontext,
-			      N_("show context between diff hunks up to the specified number of lines"),
-			      PARSE_OPT_NONEG),
+		OPT_UNSIGNED(0, "inter-hunk-context", &options->interhunkcontext,
+			     N_("show context between diff hunks up to the specified number of lines")),
 		OPT_CALLBACK_F(0, "output-indicator-new",
 			       &options->output_indicators[OUTPUT_INDICATOR_NEW],
 			       N_("<char>"),
@@ -6196,15 +6565,15 @@ static void diff_flush_patch(struct diff_filepair *p, struct diff_options *o)
 /* return 1 if any change is found; otherwise, return 0 */
 static int diff_flush_patch_quietly(struct diff_filepair *p, struct diff_options *o)
 {
-	int saved_dry_run = o->dry_run;
+	FILE *saved_file = o->file;
 	int saved_found_changes = o->found_changes;
 	int ret;
 
-	o->dry_run = 1;
+	o->file = NULL;
 	o->found_changes = 0;
 	diff_flush_patch(p, o);
 	ret = o->found_changes;
-	o->dry_run = saved_dry_run;
+	o->file = saved_file;
 	o->found_changes |= saved_found_changes;
 	return ret;
 }
@@ -6832,37 +7201,17 @@ void diff_flush(struct diff_options *options)
 			     DIFF_FORMAT_NAME |
 			     DIFF_FORMAT_NAME_STATUS |
 			     DIFF_FORMAT_CHECKDIFF)) {
-		/*
-		 * make sure diff_Flush_patch_quietly() to be silent.
-		 */
-		FILE *dev_null = NULL;
-		int saved_color_moved = options->color_moved;
-
-		if (options->flags.diff_from_contents) {
-			dev_null = xfopen("/dev/null", "w");
-			options->color_moved = 0;
-		}
 		for (i = 0; i < q->nr; i++) {
 			struct diff_filepair *p = q->queue[i];
 
 			if (!check_pair_status(p))
 				continue;
 
-			if (options->flags.diff_from_contents) {
-				FILE *saved_file = options->file;
-				int found_changes;
+			if (options->flags.diff_from_contents &&
+			    !diff_flush_patch_quietly(p, options))
+				continue;
 
-				options->file = dev_null;
-				found_changes = diff_flush_patch_quietly(p, options);
-				options->file = saved_file;
-				if (!found_changes)
-					continue;
-			}
 			flush_one_pair(p, options);
-		}
-		if (options->flags.diff_from_contents) {
-			fclose(dev_null);
-			options->color_moved = saved_color_moved;
 		}
 		separator++;
 	}
@@ -6914,15 +7263,6 @@ void diff_flush(struct diff_options *options)
 	if (output_format & DIFF_FORMAT_NO_OUTPUT &&
 	    options->flags.exit_with_status &&
 	    options->flags.diff_from_contents) {
-		/*
-		 * run diff_flush_patch for the exit status. setting
-		 * options->file to /dev/null should be safe, because we
-		 * aren't supposed to produce any output anyway.
-		 */
-		diff_free_file(options);
-		options->file = xfopen("/dev/null", "w");
-		options->close_file = 1;
-		options->color_moved = 0;
 		for (i = 0; i < q->nr; i++) {
 			struct diff_filepair *p = q->queue[i];
 			if (check_pair_status(p))
@@ -7073,6 +7413,7 @@ static void diffcore_skip_stat_unmatch(struct diff_options *diffopt)
 			if (!diffopt->flags.no_index)
 				diffopt->skip_stat_unmatch++;
 			diff_free_filepair(p);
+			q->queue[i] = NULL;
 		}
 	}
 	free(q->queue);
@@ -7116,6 +7457,10 @@ void diff_queued_diff_prefetch(void *repository)
 
 	for (i = 0; i < q->nr; i++) {
 		struct diff_filepair *p = q->queue[i];
+
+		if (!p)
+			continue;
+
 		diff_add_if_missing(repo, &to_fetch, p->one);
 		diff_add_if_missing(repo, &to_fetch, p->two);
 	}
@@ -7151,7 +7496,7 @@ void diffcore_std(struct diff_options *options)
 	 * If no prefetching occurs, diffcore_rename() will prefetch if it
 	 * decides that it needs inexact rename detection.
 	 */
-	if (options->repo == the_repository && repo_has_promisor_remote(the_repository) &&
+	if (repo_has_promisor_remote(options->repo) &&
 	    (options->output_format & output_formats_to_prefetch ||
 	     options->pickaxe_opts & DIFF_PICKAXE_KINDS_MASK))
 		diff_queued_diff_prefetch(options->repo);
@@ -7372,6 +7717,26 @@ void diff_change(struct diff_options *options,
 	diff_queue_change(&diff_queued_diff, options, old_mode, new_mode,
 			  old_oid, new_oid, old_oid_valid, new_oid_valid,
 			  concatpath, old_dirty_submodule, new_dirty_submodule);
+}
+
+void diff_same(struct diff_options *options,
+	       unsigned mode,
+	       const struct object_id *oid,
+	       const char *concatpath)
+{
+	struct diff_filespec *one;
+
+	if (S_ISGITLINK(mode) && is_submodule_ignored(concatpath, options))
+		return;
+
+	if (options->prefix &&
+	    strncmp(concatpath, options->prefix, options->prefix_length))
+		return;
+
+	one = alloc_filespec(concatpath);
+	fill_filespec(one, oid, 1, mode);
+	one->count++;
+	diff_queue(&diff_queued_diff, one, one);
 }
 
 struct diff_filepair *diff_unmerge(struct diff_options *options, const char *path)

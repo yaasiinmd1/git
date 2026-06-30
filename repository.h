@@ -2,7 +2,9 @@
 #define REPOSITORY_H
 
 #include "strmap.h"
+#include "string-list.h"
 #include "repo-settings.h"
+#include "environment.h"
 
 struct config_set;
 struct git_hash_algo;
@@ -72,6 +74,13 @@ struct repository {
 	struct ref_store *refs_private;
 
 	/*
+	 * Disable ref updates. This is especially used in contexts where
+	 * transactions may still be rolled back so that we don't start to
+	 * reference objects that may vanish.
+	 */
+	bool disable_ref_updates;
+
+	/*
 	 * A strmap of ref_stores, stored by submodule name, accessible via
 	 * `repo_get_submodule_ref_store()`.
 	 */
@@ -105,6 +114,8 @@ struct repository {
 	 * A NULL value indicates that there is no working directory.
 	 */
 	char *worktree;
+	bool worktree_initialized;
+	bool worktree_config_is_bogus;
 
 	/*
 	 * Path from the root of the top-level superproject down to this
@@ -141,14 +152,37 @@ struct repository {
 	/* Repository's compatibility hash algorithm. */
 	const struct git_hash_algo *compat_hash_algo;
 
+	/* Repository's config values parsed by git_default_config() */
+	struct repo_config_values config_values_private_;
+
 	/* Repository's reference storage format, as serialized on disk. */
 	enum ref_storage_format ref_storage_format;
+	/*
+	 * Reference storage information as needed for the backend. This contains
+	 * only the payload from the reference URI without the schema.
+	 */
+	char *ref_storage_payload;
 
 	/* A unique-id for tracing purposes. */
 	int trace2_repo_id;
 
 	/* True if commit-graph has been disabled within this process. */
 	int commit_graph_disabled;
+
+	/*
+	 * Lazily-populated cache mapping hook event names to configured hooks.
+	 * NULL until first hook use.
+	 */
+	struct strmap *hook_config_cache;
+
+	/* Cached value of hook.jobs config (0 if unset, defaults to serial). */
+	unsigned int hook_jobs;
+
+	/* Cached map of event-name -> jobs count (as uintptr_t) from hook.<event>.jobs. */
+	struct strmap event_jobs;
+
+	/* Cached list of event names with hook.<event>.enabled = false. */
+	struct string_list disabled_events;
 
 	/* Configurations related to promisor remotes. */
 	char *repository_format_partial_clone;
@@ -158,12 +192,16 @@ struct repository {
 	int repository_format_worktree_config;
 	int repository_format_relative_worktrees;
 	int repository_format_precious_objects;
+	int repository_format_submodule_path_cfg;
 
 	/* Indicate if a repository has a different 'commondir' from 'gitdir' */
 	unsigned different_commondir:1;
 
 	/* Should repo_config() check for deprecated settings */
 	bool check_deprecated_config;
+
+	/* Has this repository instance been initialized? */
+	bool initialized;
 };
 
 #ifdef USE_THE_REPOSITORY_VARIABLE
@@ -183,20 +221,19 @@ const char *repo_get_work_tree(struct repository *repo);
  */
 struct set_gitdir_args {
 	const char *commondir;
-	const char *object_dir;
 	const char *graft_file;
 	const char *index_file;
-	const char *alternate_db;
-	int disable_ref_updates;
+	bool disable_ref_updates;
 };
 
 void repo_set_gitdir(struct repository *repo, const char *root,
 		     const struct set_gitdir_args *extra_args);
 void repo_set_worktree(struct repository *repo, const char *path);
-void repo_set_hash_algo(struct repository *repo, int algo);
-void repo_set_compat_hash_algo(struct repository *repo, int compat_algo);
+void repo_set_hash_algo(struct repository *repo, uint32_t algo);
+void repo_set_compat_hash_algo(struct repository *repo, uint32_t compat_algo);
 void repo_set_ref_storage_format(struct repository *repo,
-				 enum ref_storage_format format);
+				 enum ref_storage_format format,
+				 const char *payload);
 void initialize_repository(struct repository *repo);
 RESULT_MUST_BE_USED
 int repo_init(struct repository *r, const char *gitdir, const char *worktree);
@@ -241,6 +278,6 @@ void repo_update_index_if_able(struct repository *, struct lock_file *);
  * Return 1 if upgrade repository format to target_version succeeded,
  * 0 if no upgrade is necessary, and -1 when upgrade is not possible.
  */
-int upgrade_repository_format(int target_version);
+int upgrade_repository_format(struct repository *repo, int target_version);
 
 #endif /* REPOSITORY_H */

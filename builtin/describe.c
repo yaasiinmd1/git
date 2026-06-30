@@ -112,13 +112,13 @@ static int replace_name(struct commit_name *e,
 
 		if (!e->tag) {
 			t = lookup_tag(the_repository, &e->oid);
-			if (!t || parse_tag(t))
+			if (!t || parse_tag(the_repository, t))
 				return 1;
 			e->tag = t;
 		}
 
 		t = lookup_tag(the_repository, oid);
-		if (!t || parse_tag(t))
+		if (!t || parse_tag(the_repository, t))
 			return 0;
 		*tag = t;
 
@@ -154,20 +154,19 @@ static void add_to_known_names(const char *path,
 	}
 }
 
-static int get_name(const char *path, const char *referent UNUSED, const struct object_id *oid,
-		    int flag UNUSED, void *cb_data UNUSED)
+static int get_name(const struct reference *ref, void *cb_data UNUSED)
 {
 	int is_tag = 0;
 	struct object_id peeled;
 	int is_annotated, prio;
 	const char *path_to_match = NULL;
 
-	if (skip_prefix(path, "refs/tags/", &path_to_match)) {
+	if (skip_prefix(ref->name, "refs/tags/", &path_to_match)) {
 		is_tag = 1;
 	} else if (all) {
 		if ((exclude_patterns.nr || patterns.nr) &&
-		    !skip_prefix(path, "refs/heads/", &path_to_match) &&
-		    !skip_prefix(path, "refs/remotes/", &path_to_match)) {
+		    !skip_prefix(ref->name, "refs/heads/", &path_to_match) &&
+		    !skip_prefix(ref->name, "refs/remotes/", &path_to_match)) {
 			/* Only accept reference of known type if there are match/exclude patterns */
 			return 0;
 		}
@@ -209,10 +208,10 @@ static int get_name(const char *path, const char *referent UNUSED, const struct 
 	}
 
 	/* Is it annotated? */
-	if (!peel_iterated_oid(the_repository, oid, &peeled)) {
-		is_annotated = !oideq(oid, &peeled);
+	if (!reference_get_peeled_oid(the_repository, ref, &peeled)) {
+		is_annotated = !oideq(ref->oid, &peeled);
 	} else {
-		oidcpy(&peeled, oid);
+		oidcpy(&peeled, ref->oid);
 		is_annotated = 0;
 	}
 
@@ -229,7 +228,8 @@ static int get_name(const char *path, const char *referent UNUSED, const struct 
 	else
 		prio = 0;
 
-	add_to_known_names(all ? path + 5 : path + 10, &peeled, prio, oid);
+	add_to_known_names(all ? ref->name + 5 : ref->name + 10,
+			   &peeled, prio, ref->oid);
 	return 0;
 }
 
@@ -335,7 +335,7 @@ static void append_name(struct commit_name *n, struct strbuf *dst)
 {
 	if (n->prio == 2 && !n->tag) {
 		n->tag = lookup_tag(the_repository, &n->oid);
-		if (!n->tag || parse_tag(n->tag))
+		if (!n->tag || parse_tag(the_repository, n->tag))
 			die(_("annotated tag %s not available"), n->path);
 	}
 	if (n->tag && !n->name_checked) {
@@ -558,7 +558,7 @@ static void process_object(struct object *obj, const char *path, void *data)
 			describe_commit(pcd->current_commit, pcd->dst);
 			strbuf_addf(pcd->dst, ":%s", path);
 		}
-		free_commit_list(pcd->revs->commits);
+		commit_list_free(pcd->revs->commits);
 		pcd->revs->commits = NULL;
 	}
 }
@@ -641,6 +641,9 @@ int cmd_describe(int argc,
 		 const char *prefix,
 		 struct repository *repo UNUSED )
 {
+	struct refs_for_each_ref_options for_each_ref_opts = {
+		.flags = REFS_FOR_EACH_INCLUDE_BROKEN,
+	};
 	int contains = 0;
 	struct option options[] = {
 		OPT_BOOL(0, "contains",   &contains, N_("find the tag that comes after the commit")),
@@ -709,13 +712,25 @@ int cmd_describe(int argc,
 			     NULL);
 		if (always)
 			strvec_push(&args, "--always");
-		if (!all) {
+		if (!all)
 			strvec_push(&args, "--tags");
+
+		for_each_string_list_item(item, &patterns)
+			strvec_pushf(&args, "--refs=refs/tags/%s", item->string);
+		for_each_string_list_item(item, &exclude_patterns)
+			strvec_pushf(&args, "--exclude=refs/tags/%s", item->string);
+
+		if (all) {
 			for_each_string_list_item(item, &patterns)
-				strvec_pushf(&args, "--refs=refs/tags/%s", item->string);
+				strvec_pushf(&args, "--refs=refs/heads/%s", item->string);
 			for_each_string_list_item(item, &exclude_patterns)
-				strvec_pushf(&args, "--exclude=refs/tags/%s", item->string);
+				strvec_pushf(&args, "--exclude=refs/heads/%s", item->string);
+			for_each_string_list_item(item, &patterns)
+				strvec_pushf(&args, "--refs=refs/remotes/%s", item->string);
+			for_each_string_list_item(item, &exclude_patterns)
+				strvec_pushf(&args, "--exclude=refs/remotes/%s", item->string);
 		}
+
 		if (argc)
 			strvec_pushv(&args, argv);
 		else
@@ -737,9 +752,12 @@ int cmd_describe(int argc,
 		return ret;
 	}
 
+	if (!all)
+		for_each_ref_opts.prefix = "refs/tags/";
+
 	hashmap_init(&names, commit_name_neq, NULL, 0);
-	refs_for_each_rawref(get_main_ref_store(the_repository), get_name,
-			     NULL);
+	refs_for_each_ref_ext(get_main_ref_store(the_repository),
+			      get_name, NULL, &for_each_ref_opts);
 	if (!hashmap_get_size(&names) && !always)
 		die(_("No names found, cannot describe anything."));
 
@@ -778,7 +796,7 @@ int cmd_describe(int argc,
 			struct rev_info revs;
 			int fd;
 
-			setup_work_tree();
+			setup_work_tree(the_repository);
 			prepare_repo_settings(the_repository);
 			the_repository->settings.command_requires_full_index = 0;
 			repo_read_index(the_repository);

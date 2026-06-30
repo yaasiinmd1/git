@@ -77,7 +77,6 @@ static struct string_list option_required_reference = STRING_LIST_INIT_NODUP;
 static struct string_list option_optional_reference = STRING_LIST_INIT_NODUP;
 static int max_jobs = -1;
 static struct string_list option_recurse_submodules = STRING_LIST_INIT_NODUP;
-static struct list_objects_filter_options filter_options = LIST_OBJECTS_FILTER_INIT;
 static int config_filter_submodules = -1;    /* unspecified */
 static int option_remote_submodules;
 
@@ -617,13 +616,15 @@ static int git_sparse_checkout_init(const char *repo)
 {
 	struct child_process cmd = CHILD_PROCESS_INIT;
 	int result = 0;
+	struct repo_config_values *cfg = repo_config_values(the_repository);
+
 	strvec_pushl(&cmd.args, "-C", repo, "sparse-checkout", "set", NULL);
 
 	/*
 	 * We must apply the setting in the current process
 	 * for the later checkout to use the sparse-checkout file.
 	 */
-	core_apply_sparse_checkout = 1;
+	cfg->apply_sparse_checkout = 1;
 
 	cmd.git_cmd = 1;
 	if (run_command(&cmd)) {
@@ -634,7 +635,9 @@ static int git_sparse_checkout_init(const char *repo)
 	return result;
 }
 
-static int checkout(int submodule_progress, int filter_submodules,
+static int checkout(int submodule_progress,
+		    struct list_objects_filter_options *filter_options,
+		    int filter_submodules,
 		    enum ref_storage_format ref_storage_format)
 {
 	struct object_id oid;
@@ -644,6 +647,7 @@ static int checkout(int submodule_progress, int filter_submodules,
 	struct tree *tree;
 	struct tree_desc t;
 	int err = 0;
+	struct run_hooks_opt hook_opt = RUN_HOOKS_OPT_INIT_FORCE_SERIAL;
 
 	if (option_no_checkout)
 		return 0;
@@ -665,7 +669,7 @@ static int checkout(int submodule_progress, int filter_submodules,
 	}
 
 	/* We need to be in the new work tree for the checkout */
-	setup_work_tree();
+	setup_work_tree(the_repository);
 
 	repo_hold_locked_index(the_repository, &lock_file, LOCK_DIE_ON_ERROR);
 
@@ -680,10 +684,10 @@ static int checkout(int submodule_progress, int filter_submodules,
 	opts.dst_index = the_repository->index;
 	init_checkout_metadata(&opts.meta, head, &oid, NULL);
 
-	tree = parse_tree_indirect(&oid);
+	tree = repo_parse_tree_indirect(the_repository, &oid);
 	if (!tree)
 		die(_("unable to parse commit %s"), oid_to_hex(&oid));
-	if (parse_tree(tree) < 0)
+	if (repo_parse_tree(the_repository, tree) < 0)
 		exit(128);
 	init_tree_desc(&t, &tree->object.oid, tree->buffer, tree->size);
 	if (unpack_trees(1, &t, &opts) < 0)
@@ -694,8 +698,9 @@ static int checkout(int submodule_progress, int filter_submodules,
 	if (write_locked_index(the_repository->index, &lock_file, COMMIT_LOCK))
 		die(_("unable to write new index file"));
 
-	err |= run_hooks_l(the_repository, "post-checkout", oid_to_hex(null_oid(the_hash_algo)),
-			   oid_to_hex(&oid), "1", NULL);
+	strvec_pushl(&hook_opt.args, oid_to_hex(null_oid(the_hash_algo)),
+		     oid_to_hex(&oid), "1", NULL);
+	err |= run_hooks_opt(the_repository, "post-checkout", &hook_opt);
 
 	if (!err && (option_recurse_submodules.nr > 0)) {
 		struct child_process cmd = CHILD_PROCESS_INIT;
@@ -723,9 +728,9 @@ static int checkout(int submodule_progress, int filter_submodules,
 			strvec_pushf(&cmd.args, "--ref-format=%s",
 				     ref_storage_format_to_name(ref_storage_format));
 
-		if (filter_submodules && filter_options.choice)
+		if (filter_submodules && filter_options->choice)
 			strvec_pushf(&cmd.args, "--filter=%s",
-				     expand_list_objects_filter_spec(&filter_options));
+				     expand_list_objects_filter_spec(filter_options));
 
 		if (option_single_branch >= 0)
 			strvec_push(&cmd.args, option_single_branch ?
@@ -903,6 +908,7 @@ int cmd_clone(int argc,
 	enum transport_family family = TRANSPORT_FAMILY_ALL;
 	struct string_list option_config = STRING_LIST_INIT_DUP;
 	int option_dissociate = 0;
+	struct list_objects_filter_options filter_options = LIST_OBJECTS_FILTER_INIT;
 	int option_filter_submodules = -1; /* unspecified */
 	struct string_list server_options = STRING_LIST_INIT_NODUP;
 	const char *bundle_uri = NULL;
@@ -998,6 +1004,8 @@ int cmd_clone(int argc,
 		N_("git clone [<options>] [--] <repo> [<dir>]"),
 		NULL
 	};
+
+	filter_options.allow_auto_filter = 1;
 
 	packet_trace_identity("clone");
 
@@ -1108,7 +1116,7 @@ int cmd_clone(int argc,
 			die_errno(_("could not create work tree dir '%s'"),
 				  work_tree);
 		junk_work_tree = work_tree;
-		set_git_work_tree(work_tree);
+		set_git_work_tree(the_repository, work_tree);
 	}
 
 	if (real_git_dir) {
@@ -1136,8 +1144,7 @@ int cmd_clone(int argc,
 		int val;
 
 		/* remove duplicates */
-		string_list_sort(&option_recurse_submodules);
-		string_list_remove_duplicates(&option_recurse_submodules, 0);
+		string_list_sort_u(&option_recurse_submodules, 0);
 
 		/*
 		 * NEEDSWORK: In a multi-working-tree world, this needs to be
@@ -1179,7 +1186,7 @@ int cmd_clone(int argc,
 	 * repository, and reference backends may persist that information into
 	 * their on-disk data structures.
 	 */
-	init_db(git_dir, real_git_dir, option_template, GIT_HASH_UNKNOWN,
+	init_db(the_repository, git_dir, real_git_dir, option_template, GIT_HASH_UNKNOWN,
 		ref_storage_format, NULL,
 		do_not_override_repo_unix_permissions, INIT_DB_QUIET | INIT_DB_SKIP_REFDB);
 
@@ -1222,15 +1229,10 @@ int cmd_clone(int argc,
 	 *
 	 * This is sufficient for Git commands to discover the Git directory.
 	 */
-	initialize_repository_version(GIT_HASH_UNKNOWN,
+	initialize_repository_version(the_repository, GIT_HASH_UNKNOWN,
 				      the_repository->ref_storage_format, 1);
 
-	strbuf_addf(&buf, "%s/HEAD", git_dir);
-	write_file(buf.buf, "ref: refs/heads/.invalid");
-
-	strbuf_reset(&buf);
-	strbuf_addf(&buf, "%s/refs", git_dir);
-	safe_create_dir(the_repository, buf.buf, 1);
+	refs_create_refdir_stubs(the_repository, git_dir, NULL);
 
 	/*
 	 * additional config can be injected with -c, make sure it's included
@@ -1440,9 +1442,9 @@ int cmd_clone(int argc,
 	 * ours to the same thing.
 	 */
 	hash_algo = hash_algo_by_ptr(transport_get_hash_algo(transport));
-	initialize_repository_version(hash_algo, the_repository->ref_storage_format, 1);
+	initialize_repository_version(the_repository, hash_algo, the_repository->ref_storage_format, 1);
 	repo_set_hash_algo(the_repository, hash_algo);
-	create_reference_database(the_repository->ref_storage_format, NULL, 1);
+	create_reference_database(the_repository, NULL, 1);
 
 	/*
 	 * Before fetching from the remote, download and install bundle
@@ -1617,7 +1619,7 @@ int cmd_clone(int argc,
 	transport_disconnect(transport);
 
 	if (option_dissociate) {
-		close_object_store(the_repository->objects);
+		odb_close(the_repository->objects);
 		dissociate_from_references();
 	}
 
@@ -1625,8 +1627,12 @@ int cmd_clone(int argc,
 		return 1;
 
 	junk_mode = JUNK_LEAVE_REPO;
-	err = checkout(submodule_progress, filter_submodules,
+	err = checkout(submodule_progress,
+		       &filter_options,
+		       filter_submodules,
 		       ref_storage_format);
+
+	list_objects_filter_release(&filter_options);
 
 	string_list_clear(&option_not, 0);
 	string_list_clear(&option_config, 0);

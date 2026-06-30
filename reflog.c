@@ -154,7 +154,7 @@ static int tree_is_complete(const struct object_id *oid)
 
 	if (!tree->buffer) {
 		enum object_type type;
-		unsigned long size;
+		size_t size;
 		void *data = odb_read_object(the_repository->objects, oid,
 					     &type, &size);
 		if (!data) {
@@ -168,7 +168,7 @@ static int tree_is_complete(const struct object_id *oid)
 	complete = 1;
 	while (tree_entry(&desc, &entry)) {
 		if (!odb_has_object(the_repository->objects, &entry.oid,
-				HAS_OBJECT_RECHECK_PACKED | HAS_OBJECT_FETCH_PROMISOR) ||
+				ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR) ||
 		    (S_ISDIR(entry.mode) && !tree_is_complete(&entry.oid))) {
 			tree->object.flags |= INCOMPLETE;
 			complete = 0;
@@ -423,16 +423,13 @@ int should_expire_reflog_ent_verbose(struct object_id *ooid,
 	return expire;
 }
 
-static int push_tip_to_list(const char *refname UNUSED,
-			    const char *referent UNUSED,
-			    const struct object_id *oid,
-			    int flags, void *cb_data)
+static int push_tip_to_list(const struct reference *ref, void *cb_data)
 {
 	struct commit_list **list = cb_data;
 	struct commit *tip_commit;
-	if (flags & REF_ISSYMREF)
+	if (ref->flags & REF_ISSYMREF)
 		return 0;
-	tip_commit = lookup_commit_reference_gently(the_repository, oid, 1);
+	tip_commit = lookup_commit_reference_gently(the_repository, ref->oid, 1);
 	if (!tip_commit)
 		return 0;
 	commit_list_insert(tip_commit, list);
@@ -496,7 +493,7 @@ void reflog_expiry_cleanup(void *cb_data)
 	case UE_HEAD:
 		for (elem = cb->tips; elem; elem = elem->next)
 			clear_commit_marks(elem->item, REACHABLE);
-		free_commit_list(cb->tips);
+		commit_list_free(cb->tips);
 		break;
 	case UE_NORMAL:
 		clear_commit_marks(cb->tip_commit, REACHABLE);
@@ -504,7 +501,7 @@ void reflog_expiry_cleanup(void *cb_data)
 	}
 	for (elem = cb->mark_list; elem; elem = elem->next)
 		clear_commit_marks(elem->item, REACHABLE);
-	free_commit_list(cb->mark_list);
+	commit_list_free(cb->mark_list);
 }
 
 int count_reflog_ent(const char *refname UNUSED,

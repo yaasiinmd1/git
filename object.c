@@ -6,6 +6,7 @@
 #include "object.h"
 #include "replace-object.h"
 #include "object-file.h"
+#include "odb/streaming.h"
 #include "blob.h"
 #include "statinfo.h"
 #include "tree.h"
@@ -207,9 +208,11 @@ struct object *lookup_object_by_type(struct repository *r,
 	}
 }
 
-enum peel_status peel_object(struct repository *r,
-			     const struct object_id *name,
-			     struct object_id *oid)
+enum peel_status peel_object_ext(struct repository *r,
+				 const struct object_id *name,
+				 struct object_id *oid,
+				 unsigned flags,
+				 enum object_type *typep)
 {
 	struct object *o = lookup_unknown_object(r, name);
 
@@ -219,15 +222,40 @@ enum peel_status peel_object(struct repository *r,
 			return PEEL_INVALID;
 	}
 
-	if (o->type != OBJ_TAG)
+	if (o->type != OBJ_TAG) {
+		*typep = o->type;
 		return PEEL_NON_TAG;
+	}
 
-	o = deref_tag_noverify(r, o);
+	while (o && o->type == OBJ_TAG) {
+		o = parse_object(r, &o->oid);
+		if (o && o->type == OBJ_TAG && ((struct tag *)o)->tagged) {
+			o = ((struct tag *)o)->tagged;
+
+			if (flags & PEEL_OBJECT_VERIFY_TAGGED_OBJECT_TYPE) {
+				int type = odb_read_object_info(r->objects, &o->oid, NULL);
+				if (type < 0 || !object_as_type(o, type, 0))
+					return PEEL_INVALID;
+			}
+		} else {
+			o = NULL;
+		}
+	}
 	if (!o)
 		return PEEL_INVALID;
 
 	oidcpy(oid, &o->oid);
+	*typep = o->type;
 	return PEEL_PEELED;
+}
+
+enum peel_status peel_object(struct repository *r,
+			     const struct object_id *name,
+			     struct object_id *oid,
+			     unsigned flags)
+{
+	enum object_type dummy;
+	return peel_object_ext(r, name, oid, flags, &dummy);
 }
 
 struct object *parse_object_buffer(struct repository *r, const struct object_id *oid, enum object_type type, unsigned long size, void *buffer, int *eaten_p)
@@ -297,7 +325,7 @@ struct object *parse_object_with_flags(struct repository *r,
 {
 	int skip_hash = !!(flags & PARSE_OBJECT_SKIP_HASH_CHECK);
 	int discard_tree = !!(flags & PARSE_OBJECT_DISCARD_TREE);
-	unsigned long size;
+	size_t size;
 	enum object_type type;
 	int eaten;
 	const struct object_id *repl = lookup_replace_object(r, oid);
@@ -314,11 +342,23 @@ struct object *parse_object_with_flags(struct repository *r,
 			return &commit->object;
 	}
 
-	if ((!obj || obj->type == OBJ_BLOB) &&
+	if ((!obj || obj->type == OBJ_NONE || obj->type == OBJ_BLOB) &&
 	    odb_read_object_info(r->objects, oid, NULL) == OBJ_BLOB) {
-		if (!skip_hash && stream_object_signature(r, repl) < 0) {
-			error(_("hash mismatch %s"), oid_to_hex(oid));
-			return NULL;
+		if (!skip_hash) {
+			struct odb_read_stream *stream = odb_read_stream_open(r->objects, oid, NULL);
+
+			if (!stream) {
+				error(_("unable to open object stream for %s"), oid_to_hex(oid));
+				return NULL;
+			}
+
+			if (stream_object_signature(r, stream, repl) < 0) {
+				error(_("hash mismatch %s"), oid_to_hex(oid));
+				odb_read_stream_close(stream);
+				return NULL;
+			}
+
+			odb_read_stream_close(stream);
 		}
 		parse_blob_buffer(lookup_blob(r, oid));
 		return lookup_object(r, oid);
@@ -330,7 +370,7 @@ struct object *parse_object_with_flags(struct repository *r,
 	 * have the on-disk object with the correct type.
 	 */
 	if (skip_hash && discard_tree &&
-	    (!obj || obj->type == OBJ_TREE) &&
+	    (!obj || obj->type == OBJ_NONE || obj->type == OBJ_TREE) &&
 	    odb_read_object_info(r->objects, oid, NULL) == OBJ_TREE) {
 		return &lookup_tree(r, oid)->object;
 	}

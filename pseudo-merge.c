@@ -150,7 +150,10 @@ static int pseudo_merge_config(const char *var, const char *value,
 	if (!strcmp(key, "pattern")) {
 		struct strbuf re = STRBUF_INIT;
 
-		free(group->pattern);
+		if (group->pattern) {
+			regfree(group->pattern);
+			free(group->pattern);
+		}
 		if (*value != '^')
 			strbuf_addch(&re, '^');
 		strbuf_addstr(&re, value);
@@ -169,8 +172,8 @@ static int pseudo_merge_config(const char *var, const char *value,
 		}
 	} else if (!strcmp(key, "samplerate")) {
 		group->sample_rate = git_config_double(var, value, ctx->kvi);
-		if (!(0 <= group->sample_rate && group->sample_rate <= 1)) {
-			warning(_("%s must be between 0 and 1, using default"), var);
+		if (!(0 < group->sample_rate && group->sample_rate <= 1)) {
+			warning(_("%s must be between 0 (exclusive) and 1, using default"), var);
 			group->sample_rate = DEFAULT_PSEUDO_MERGE_SAMPLE_RATE;
 		}
 	} else if (!strcmp(key, "threshold")) {
@@ -221,28 +224,27 @@ void load_pseudo_merges_from_config(struct repository *r,
 	}
 }
 
-static int find_pseudo_merge_group_for_ref(const char *refname,
-					   const char *referent UNUSED,
-					   const struct object_id *oid,
-					   int flags UNUSED,
-					   void *_data)
+static int find_pseudo_merge_group_for_ref(const struct reference *ref, void *_data)
 {
 	struct bitmap_writer *writer = _data;
+	const struct object_id *maybe_peeled = ref->oid;
 	struct object_id peeled;
 	struct commit *c;
 	uint32_t i;
 	int has_bitmap;
 
-	if (!peel_iterated_oid(the_repository, oid, &peeled))
-		oid = &peeled;
+	if (!reference_get_peeled_oid(the_repository, ref, &peeled))
+		maybe_peeled = &peeled;
 
-	c = lookup_commit(the_repository, oid);
+	c = lookup_commit(the_repository, maybe_peeled);
 	if (!c)
 		return 0;
-	if (!packlist_find(writer->to_pack, oid))
+	if (repo_parse_commit(the_repository, c))
+		return 0;
+	if (!packlist_find(writer->to_pack, maybe_peeled))
 		return 0;
 
-	has_bitmap = bitmap_writer_has_bitmapped_object_id(writer, oid);
+	has_bitmap = bitmap_writer_has_bitmapped_object_id(writer, maybe_peeled);
 
 	for (i = 0; i < writer->pseudo_merge_groups.nr; i++) {
 		struct pseudo_merge_group *group;
@@ -252,7 +254,7 @@ static int find_pseudo_merge_group_for_ref(const char *refname,
 		size_t j;
 
 		group = writer->pseudo_merge_groups.items[i].util;
-		if (regexec(group->pattern, refname, ARRAY_SIZE(captures),
+		if (regexec(group->pattern, ref->name, ARRAY_SIZE(captures),
 			    captures, 0))
 			continue;
 
@@ -269,7 +271,7 @@ static int find_pseudo_merge_group_for_ref(const char *refname,
 			if (group_name.len)
 				strbuf_addch(&group_name, '-');
 
-			strbuf_add(&group_name, refname + match->rm_so,
+			strbuf_add(&group_name, ref->name + match->rm_so,
 				   match->rm_eo - match->rm_so);
 		}
 
@@ -562,9 +564,9 @@ static struct pseudo_merge *pseudo_merge_at(const struct pseudo_merge_map *pm,
 		if (got == want)
 			return use_pseudo_merge(pm, &pm->v[mi]);
 		else if (got < want)
-			hi = mi;
-		else
 			lo = mi + 1;
+		else
+			hi = mi;
 	}
 
 	warning(_("could not find pseudo-merge for commit %s at offset %"PRIuMAX),
@@ -603,7 +605,7 @@ static int nth_pseudo_merge_ext(const struct pseudo_merge_map *pm,
 		return error(_("out-of-bounds read: (%"PRIuMAX" >= %"PRIuMAX")"),
 			     (uintmax_t)ofs, (uintmax_t)pm->map_size);
 
-	read_pseudo_merge_commit_at(merge, pm->map + ofs);
+	merge->pseudo_merge_ofs = ofs;
 
 	return 0;
 }
@@ -641,14 +643,21 @@ static int pseudo_merge_commit_cmp(const void *va, const void *vb)
 	return 0;
 }
 
-static struct pseudo_merge_commit *find_pseudo_merge(const struct pseudo_merge_map *pm,
-						     uint32_t pos)
+static int find_pseudo_merge(const struct pseudo_merge_map *pm, uint32_t pos,
+			     struct pseudo_merge_commit *out)
 {
-	if (!pm->commits_nr)
-		return NULL;
+	const unsigned char *at;
 
-	return bsearch(&pos, pm->commits, pm->commits_nr,
-		       PSEUDO_MERGE_COMMIT_RAWSZ, pseudo_merge_commit_cmp);
+	if (!pm->commits_nr)
+		return 0;
+
+	at = bsearch(&pos, pm->commits, pm->commits_nr,
+		     PSEUDO_MERGE_COMMIT_RAWSZ, pseudo_merge_commit_cmp);
+	if (!at)
+		return 0;
+
+	read_pseudo_merge_commit_at(out, at);
+	return 1;
 }
 
 int apply_pseudo_merges_for_commit(const struct pseudo_merge_map *pm,
@@ -656,19 +665,18 @@ int apply_pseudo_merges_for_commit(const struct pseudo_merge_map *pm,
 				   struct commit *commit, uint32_t commit_pos)
 {
 	struct pseudo_merge *merge;
-	struct pseudo_merge_commit *merge_commit;
+	struct pseudo_merge_commit merge_commit;
 	int ret = 0;
 
-	merge_commit = find_pseudo_merge(pm, commit_pos);
-	if (!merge_commit)
+	if (!find_pseudo_merge(pm, commit_pos, &merge_commit))
 		return 0;
 
-	if (merge_commit->pseudo_merge_ofs & ((uint64_t)1<<63)) {
+	if (merge_commit.pseudo_merge_ofs & ((uint64_t)1<<63)) {
 		struct pseudo_merge_commit_ext ext = { 0 };
-		off_t ofs = merge_commit->pseudo_merge_ofs & ~((uint64_t)1<<63);
+		off_t ofs = merge_commit.pseudo_merge_ofs & ~((uint64_t)1<<63);
 		uint32_t i;
 
-		if (pseudo_merge_ext_at(pm, &ext, ofs) < -1) {
+		if (pseudo_merge_ext_at(pm, &ext, ofs) < 0) {
 			warning(_("could not read extended pseudo-merge table "
 				  "for commit %s"),
 				oid_to_hex(&commit->object.oid));
@@ -676,11 +684,11 @@ int apply_pseudo_merges_for_commit(const struct pseudo_merge_map *pm,
 		}
 
 		for (i = 0; i < ext.nr; i++) {
-			if (nth_pseudo_merge_ext(pm, &ext, merge_commit, i) < 0)
+			if (nth_pseudo_merge_ext(pm, &ext, &merge_commit, i) < 0)
 				return ret;
 
 			merge = pseudo_merge_at(pm, &commit->object.oid,
-						merge_commit->pseudo_merge_ofs);
+						merge_commit.pseudo_merge_ofs);
 
 			if (!merge)
 				return ret;
@@ -690,7 +698,7 @@ int apply_pseudo_merges_for_commit(const struct pseudo_merge_map *pm,
 		}
 	} else {
 		merge = pseudo_merge_at(pm, &commit->object.oid,
-					merge_commit->pseudo_merge_ofs);
+					merge_commit.pseudo_merge_ofs);
 
 		if (!merge)
 			return ret;

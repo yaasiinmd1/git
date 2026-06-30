@@ -382,7 +382,8 @@ static int verify_gpg_signed_buffer(struct signature_check *sigc,
 
 	delete_tempfile(&temp);
 
-	ret |= !strstr(gpg_stdout.buf, "\n[GNUPG:] GOODSIG ");
+	ret |= !strstr(gpg_stdout.buf, "\n[GNUPG:] GOODSIG ") &&
+	       !strstr(gpg_stdout.buf, "\n[GNUPG:] EXPKEYSIG ");
 	sigc->output = strbuf_detach(&gpg_stderr, NULL);
 	sigc->gpg_status = strbuf_detach(&gpg_stdout, NULL);
 
@@ -398,7 +399,7 @@ static void parse_ssh_output(struct signature_check *sigc)
 {
 	const char *line, *principal, *search;
 	char *to_free;
-	char *key = NULL;
+	const char *key;
 
 	/*
 	 * ssh-keygen output should be:
@@ -443,7 +444,7 @@ static void parse_ssh_output(struct signature_check *sigc)
 
 	key = strstr(line, "key ");
 	if (key) {
-		sigc->fingerprint = xstrdup(strstr(line, "key ") + 4);
+		sigc->fingerprint = xstrdup(key + 4);
 		sigc->key = xstrdup(sigc->fingerprint);
 	} else {
 		/*
@@ -680,7 +681,7 @@ int check_signature(struct signature_check *sigc,
 	if (status && !sigc->output)
 		return !!status;
 
-	status |= sigc->result != 'G';
+	status |= sigc->result != 'G' && sigc->result != 'Y';
 	status |= sigc->trust_level < configured_min_trust_level;
 
 	return !!status;
@@ -794,8 +795,16 @@ static int git_gpg_config(const char *var, const char *value,
 		fmtname = "ssh";
 
 	if (fmtname) {
+		char *program;
+		int status;
+
 		fmt = get_format_by_name(fmtname);
-		return git_config_pathname((char **) &fmt->program, var, value);
+		status = git_config_pathname(&program, var, value);
+		if (status)
+			return status;
+		if (program)
+			fmt->program = program;
+		return status;
 	}
 
 	return 0;
@@ -879,7 +888,7 @@ static char *get_default_ssh_signing_key(void)
 	n = split_cmdline(key_command, &argv);
 
 	if (n < 0)
-		die("malformed build-time gpg.ssh.defaultKeyCommand: %s",
+		die(_("malformed build-time gpg.ssh.defaultKeyCommand: %s"),
 		    split_cmdline_strerror(n));
 
 	strvec_pushv(&ssh_default_key.args, argv);
@@ -965,11 +974,20 @@ const char *gpg_trust_level_to_str(enum signature_trust_level level)
 	return sigcheck_gpg_trust_level[level].display_key;
 }
 
-int sign_buffer(struct strbuf *buffer, struct strbuf *signature, const char *signing_key)
+int sign_buffer(struct strbuf *buffer, struct strbuf *signature,
+		const char *signing_key, enum sign_buffer_flags flags)
 {
+	char *keyid_to_free = NULL;
+	int ret = 0;
+
 	gpg_interface_lazy_init();
 
-	return use_format->sign_buffer(buffer, signature, signing_key);
+	if ((flags & SIGN_BUFFER_USE_DEFAULT_KEY) && (!signing_key || !*signing_key))
+		signing_key = keyid_to_free = get_signing_key();
+
+	ret = use_format->sign_buffer(buffer, signature, signing_key);
+	free(keyid_to_free);
+	return ret;
 }
 
 /*
@@ -1134,19 +1152,30 @@ out:
 	return ret;
 }
 
-int parse_sign_mode(const char *arg, enum sign_mode *mode)
+int parse_sign_mode(const char *arg, enum sign_mode *mode, const char **keyid)
 {
-	if (!strcmp(arg, "abort"))
+	if (!strcmp(arg, "abort")) {
 		*mode = SIGN_ABORT;
-	else if (!strcmp(arg, "verbatim") || !strcmp(arg, "ignore"))
+	} else if (!strcmp(arg, "verbatim") || !strcmp(arg, "ignore")) {
 		*mode = SIGN_VERBATIM;
-	else if (!strcmp(arg, "warn-verbatim") || !strcmp(arg, "warn"))
+	} else if (!strcmp(arg, "warn-verbatim") || !strcmp(arg, "warn")) {
 		*mode = SIGN_WARN_VERBATIM;
-	else if (!strcmp(arg, "warn-strip"))
+	} else if (!strcmp(arg, "warn-strip")) {
 		*mode = SIGN_WARN_STRIP;
-	else if (!strcmp(arg, "strip"))
+	} else if (!strcmp(arg, "strip")) {
 		*mode = SIGN_STRIP;
-	else
+	} else if (!strcmp(arg, "abort-if-invalid")) {
+		*mode = SIGN_ABORT_IF_INVALID;
+	} else if (!strcmp(arg, "strip-if-invalid")) {
+		*mode = SIGN_STRIP_IF_INVALID;
+	} else if (!strcmp(arg, "sign-if-invalid")) {
+		*mode = SIGN_SIGN_IF_INVALID;
+	} else if (skip_prefix(arg, "sign-if-invalid=", &arg)) {
+		*mode = SIGN_SIGN_IF_INVALID;
+		if (keyid)
+			*keyid = arg;
+	} else {
 		return -1;
+	}
 	return 0;
 }

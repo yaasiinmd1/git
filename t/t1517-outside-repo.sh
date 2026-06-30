@@ -93,6 +93,14 @@ test_expect_success 'diff outside repository' '
 	test_cmp expect actual
 '
 
+test_expect_success 'hash object exceeding bigFileThreshold outside repository' '
+	(
+		cd non-repo &&
+		echo foo >foo &&
+		git -c core.bigFileThreshold=1 hash-object --stdin <foo
+	)
+'
+
 test_expect_success 'stripspace outside repository' '
 	nongit git stripspace -s </dev/null
 '
@@ -114,7 +122,8 @@ do
 	archimport | citool | credential-netrc | credential-libsecret | \
 	credential-osxkeychain | cvsexportcommit | cvsimport | cvsserver | \
 	daemon | \
-	difftool--helper | filter-branch | fsck-objects | get-tar-commit-id | \
+	difftool--helper | filter-branch | format-rev | fsck-objects | \
+	get-tar-commit-id | \
 	gui | gui--askpass | \
 	http-backend | http-fetch | http-push | init-db | \
 	merge-octopus | merge-one-file | merge-resolve | mergetool | \

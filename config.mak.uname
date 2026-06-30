@@ -63,11 +63,22 @@ ifeq ($(uname_S),Linux)
 	PROCFS_EXECUTABLE_PATH = /proc/self/exe
 	HAVE_PLATFORM_PROCINFO = YesPlease
 	COMPAT_OBJS += compat/linux/procinfo.o
+	EXTLIBS += -ldl
 	# centos7/rhel7 provides gcc 4.8.5 and zlib 1.2.7.
         ifneq ($(findstring .el7.,$(uname_R)),)
 		BASIC_CFLAGS += -std=c99
         endif
 	LINK_FUZZ_PROGRAMS = YesPlease
+
+	# The builtin FSMonitor on Linux builds upon Simple-IPC.  Both require
+	# Unix domain sockets and PThreads.
+        ifndef NO_PTHREADS
+        ifndef NO_UNIX_SOCKETS
+	FSMONITOR_DAEMON_BACKEND = linux
+	FSMONITOR_OS_SETTINGS = unix
+	BASIC_CFLAGS += -DHAVE_LINUX_MAGIC_H
+        endif
+        endif
 endif
 ifeq ($(uname_S),GNU/kFreeBSD)
 	HAVE_ALLOCA_H = YesPlease
@@ -124,6 +135,7 @@ ifeq ($(uname_S),Darwin)
 	# - MacOS 10.0.* and MacOS 10.1.0 = Darwin 1.*
 	# - MacOS 10.x.* = Darwin (x+4).* for (1 <= x)
 	# i.e. "begins with [15678] and a dot" means "10.4.* or older".
+	DARWIN_MAJOR_VERSION = $(shell expr "$(uname_R)" : '\([0-9]*\)\.')
         ifeq ($(shell expr "$(uname_R)" : '[15678]\.'),2)
 		OLD_ICONV = UnfortunatelyYes
 		NO_APPLE_COMMON_CRYPTO = YesPlease
@@ -148,29 +160,30 @@ ifeq ($(uname_S),Darwin)
 	HAVE_NS_GET_EXECUTABLE_PATH = YesPlease
 	CSPRNG_METHOD = arc4random
 	USE_ENHANCED_BASIC_REGULAR_EXPRESSIONS = YesPlease
+	HAVE_PLATFORM_PROCINFO = YesPlease
+	COMPAT_OBJS += compat/darwin/procinfo.o
 
-	# Workaround for `gettext` being keg-only and not even being linked via
-	# `brew link --force gettext`, should be obsolete as of
-	# https://github.com/Homebrew/homebrew-core/pull/53489
-        ifeq ($(shell test -d /usr/local/opt/gettext/ && echo y),y)
-		BASIC_CFLAGS += -I/usr/local/include -I/usr/local/opt/gettext/include
-		BASIC_LDFLAGS += -L/usr/local/lib -L/usr/local/opt/gettext/lib
-                ifeq ($(shell test -x /usr/local/opt/gettext/bin/msgfmt && echo y),y)
-			MSGFMT = /usr/local/opt/gettext/bin/msgfmt
-                endif
-	# On newer ARM-based machines the default installation path has changed to
-	# /opt/homebrew. Include it in our search paths so that the user does not
-	# have to configure this manually.
-	#
-	# Note that we do not employ the same workaround as above where we manually
-	# add gettext. The issue was fixed more than three years ago by now, and at
-	# that point there haven't been any ARM-based Macs yet.
-        else ifeq ($(shell test -d /opt/homebrew/ && echo y),y)
-		BASIC_CFLAGS += -I/opt/homebrew/include
-		BASIC_LDFLAGS += -L/opt/homebrew/lib
-                ifeq ($(shell test -x /opt/homebrew/bin/msgfmt && echo y),y)
-			MSGFMT = /opt/homebrew/bin/msgfmt
-                endif
+        ifeq ($(uname_M),arm64)
+		HOMEBREW_PREFIX = /opt/homebrew
+        else
+		HOMEBREW_PREFIX = /usr/local
+        endif
+        ifeq ($(shell test "$(DARWIN_MAJOR_VERSION)" -ge 24 && echo 1),1)
+		USE_HOMEBREW_LIBICONV = UnfortunatelyYes
+		NEEDS_GOOD_LIBICONV = UnfortunatelyYes
+        endif
+
+	# ld reports "PROJECT:{ld,ld64,dyld}-NNN", match any of the three.
+	LD_MAJOR_VERSION = $(shell ld -v 2>&1 | sed -n 's/.*PROJECT:[^ ]*-\([0-9][0-9]*\).*/\1/p')
+
+	# Silence the Xcode 15+ warning about archives listed more than once.
+        ifeq ($(shell test -n "$(LD_MAJOR_VERSION)" && test "$(LD_MAJOR_VERSION)" -ge 907 && echo 1),1)
+		BASIC_LDFLAGS += -Wl,-no_warn_duplicate_libraries
+        endif
+
+	# Silence the Xcode 16.3+ warning about __DATA,__common alignment.
+        ifeq ($(shell test -n "$(LD_MAJOR_VERSION)" && test "$(LD_MAJOR_VERSION)" -ge 1167 && echo 1),1)
+		BASIC_CFLAGS += -fno-common
         endif
 
 	# The builtin FSMonitor on MacOS builds upon Simple-IPC.  Both require
@@ -178,7 +191,7 @@ ifeq ($(uname_S),Darwin)
         ifndef NO_PTHREADS
         ifndef NO_UNIX_SOCKETS
 	FSMONITOR_DAEMON_BACKEND = darwin
-	FSMONITOR_OS_SETTINGS = darwin
+	FSMONITOR_OS_SETTINGS = unix
         endif
         endif
 
@@ -502,7 +515,6 @@ ifeq ($(uname_S),Windows)
 	USE_WIN32_IPC = YesPlease
 	USE_WIN32_MMAP = YesPlease
 	MMAP_PREVENTS_DELETE = UnfortunatelyYes
-	# USE_NED_ALLOCATOR = YesPlease
 	UNRELIABLE_FSTAT = UnfortunatelyYes
 	OBJECT_CREATION_USES_RENAMES = UnfortunatelyNeedsTo
 	NO_REGEX = YesPlease
@@ -769,9 +781,6 @@ ifeq ($(uname_S),MINGW)
 	HAVE_LIBCHARSET_H = YesPlease
 	USE_GETTEXT_SCHEME = fallthrough
 	USE_LIBPCRE = YesPlease
-        ifneq (CLANGARM64,$(MSYSTEM))
-		USE_NED_ALLOCATOR = YesPlease
-        endif
         ifeq (/mingw64,$(subst 32,64,$(subst clangarm,mingw,$(prefix))))
 		# Move system config into top-level /etc/
 		ETC_GITCONFIG = ../etc/gitconfig

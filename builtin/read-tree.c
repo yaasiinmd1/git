@@ -32,7 +32,7 @@ static int list_tree(struct object_id *oid)
 
 	if (nr_trees >= MAX_UNPACK_TREES)
 		die("I cannot read more than %d trees", MAX_UNPACK_TREES);
-	tree = parse_tree_indirect(oid);
+	tree = repo_parse_tree_indirect(the_repository, oid);
 	if (!tree)
 		return -1;
 	trees[nr_trees++] = tree;
@@ -229,7 +229,7 @@ int cmd_read_tree(int argc,
 		opts.preserve_ignored = 0;
 	/* otherwise, opts.preserve_ignored is irrelevant */
 	if (opts.merge && !opts.index_only)
-		setup_work_tree();
+		setup_work_tree(the_repository);
 
 	if (opts.skip_sparse_checkout)
 		ensure_full_index(the_repository->index);
@@ -268,7 +268,7 @@ int cmd_read_tree(int argc,
 	cache_tree_free(&the_repository->index->cache_tree);
 	for (i = 0; i < nr_trees; i++) {
 		struct tree *tree = trees[i];
-		if (parse_tree(tree) < 0)
+		if (repo_parse_tree(the_repository, tree) < 0)
 			return 128;
 		init_tree_desc(t+i, &tree->object.oid, tree->buffer, tree->size);
 	}

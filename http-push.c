@@ -99,12 +99,12 @@ static struct object_list *objects;
 
 struct repo {
 	char *url;
-	char *path;
+	const char *path;
 	int path_len;
 	int has_info_refs;
 	int can_update_info_refs;
 	int has_info_packs;
-	struct packed_git *packs;
+	struct packfile_list packs;
 	struct remote_lock *locks;
 };
 
@@ -311,7 +311,7 @@ static void start_fetch_packed(struct transfer_request *request)
 	struct transfer_request *check_request = request_queue_head;
 	struct http_pack_request *preq;
 
-	target = find_oid_pack(&request->obj->oid, repo->packs);
+	target = packfile_list_find_oid(repo->packs.head, &request->obj->oid);
 	if (!target) {
 		fprintf(stderr, "Unable to fetch %s, will not be able to update server info refs\n", oid_to_hex(&request->obj->oid));
 		repo->can_update_info_refs = 0;
@@ -365,17 +365,18 @@ static void start_put(struct transfer_request *request)
 	enum object_type type;
 	char hdr[50];
 	void *unpacked;
-	unsigned long len;
+	size_t len;
 	int hdrlen;
 	ssize_t size;
 	git_zstream stream;
+	struct repo_config_values *cfg = repo_config_values(the_repository);
 
 	unpacked = odb_read_object(the_repository->objects, &request->obj->oid,
 				   &type, &len);
 	hdrlen = format_object_header(hdr, sizeof(hdr), type, len);
 
 	/* Set it up */
-	git_deflate_init(&stream, zlib_compression_level);
+	git_deflate_init(&stream, cfg->zlib_compression_level);
 	size = git_deflate_bound(&stream, len + hdrlen);
 	strbuf_grow(&request->buffer.buf, size);
 	request->buffer.posn = 0;
@@ -683,7 +684,7 @@ static int add_send_request(struct object *obj, struct remote_lock *lock)
 		get_remote_object_list(obj->oid.hash[0]);
 	if (obj->flags & (REMOTE | PUSHING))
 		return 0;
-	target = find_oid_pack(&obj->oid, repo->packs);
+	target = packfile_list_find_oid(repo->packs.head, &obj->oid);
 	if (target) {
 		obj->flags |= REMOTE;
 		return 0;
@@ -1311,7 +1312,7 @@ static struct object_list **process_tree(struct tree *tree,
 
 	if (obj->flags & (UNINTERESTING | SEEN))
 		return p;
-	if (parse_tree(tree) < 0)
+	if (repo_parse_tree(the_repository, tree) < 0)
 		die("bad tree object %s", oid_to_hex(&obj->oid));
 
 	obj->flags |= SEEN;
@@ -1449,7 +1450,7 @@ static void one_remote_ref(const char *refname)
 	 */
 	if (repo->can_update_info_refs &&
 	    !odb_has_object(the_repository->objects, &ref->old_oid,
-			    HAS_OBJECT_RECHECK_PACKED | HAS_OBJECT_FETCH_PROMISOR)) {
+			    ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR)) {
 		obj = lookup_unknown_object(the_repository, &ref->old_oid);
 		fprintf(stderr,	"  fetch %s for %s\n",
 			oid_to_hex(&ref->old_oid), refname);
@@ -1655,7 +1656,7 @@ static int delete_remote_branch(const char *pattern, int force)
 		if (is_null_oid(&head_oid))
 			return error("Unable to resolve remote HEAD");
 		if (!odb_has_object(the_repository->objects, &head_oid,
-				    HAS_OBJECT_RECHECK_PACKED | HAS_OBJECT_FETCH_PROMISOR))
+				    ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR))
 			return error("Remote HEAD resolves to object %s\nwhich does not exist locally, perhaps you need to fetch?", oid_to_hex(&head_oid));
 
 		/* Remote branch must resolve to a known object */
@@ -1663,7 +1664,7 @@ static int delete_remote_branch(const char *pattern, int force)
 			return error("Unable to resolve remote branch %s",
 				     remote_ref->name);
 		if (!odb_has_object(the_repository->objects, &remote_ref->old_oid,
-				    HAS_OBJECT_RECHECK_PACKED | HAS_OBJECT_FETCH_PROMISOR))
+				    ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR))
 			return error("Remote branch %s resolves to object %s\nwhich does not exist locally, perhaps you need to fetch?", remote_ref->name, oid_to_hex(&remote_ref->old_oid));
 
 		/* Remote branch must be an ancestor of remote HEAD */
@@ -1725,6 +1726,7 @@ int cmd_main(int argc, const char **argv)
 	int i;
 	int new_refs;
 	struct ref *ref, *local_refs = NULL;
+	const char *gitdir;
 
 	CALLOC_ARRAY(repo, 1);
 
@@ -1767,7 +1769,7 @@ int cmd_main(int argc, const char **argv)
 				usage(http_push_usage);
 		}
 		if (!repo->url) {
-			char *path = strstr(arg, "//");
+			const char *path = strstr(arg, "//");
 			str_end_url_with_slash(arg, &repo->url);
 			repo->path_len = strlen(repo->url);
 			if (path) {
@@ -1787,7 +1789,7 @@ int cmd_main(int argc, const char **argv)
 	if (delete_branch && rs.nr != 1)
 		die("You must specify only one branch name when deleting a remote branch");
 
-	setup_git_directory();
+	gitdir = setup_git_directory(the_repository);
 
 	memset(remote_dir_exists, -1, 256);
 
@@ -1885,7 +1887,7 @@ int cmd_main(int argc, const char **argv)
 		    !is_null_oid(&ref->old_oid) &&
 		    !ref->force) {
 			if (!odb_has_object(the_repository->objects, &ref->old_oid,
-					    HAS_OBJECT_RECHECK_PACKED | HAS_OBJECT_FETCH_PROMISOR) ||
+					    ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR) ||
 			    !ref_newer(&ref->peer_ref->new_oid,
 				       &ref->old_oid)) {
 				/*
@@ -1941,7 +1943,7 @@ int cmd_main(int argc, const char **argv)
 		if (!push_all && !is_null_oid(&ref->old_oid))
 			strvec_pushf(&commit_argv, "^%s",
 				     oid_to_hex(&ref->old_oid));
-		repo_init_revisions(the_repository, &revs, setup_git_directory());
+		repo_init_revisions(the_repository, &revs, gitdir);
 		setup_revisions_from_strvec(&commit_argv, &revs, NULL);
 		revs.edge_hint = 0; /* just in case */
 

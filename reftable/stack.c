@@ -29,13 +29,6 @@ static int stack_filename(struct reftable_buf *dest, struct reftable_stack *st,
 	return 0;
 }
 
-static int stack_fsync(const struct reftable_write_options *opts, int fd)
-{
-	if (opts->fsync)
-		return opts->fsync(fd);
-	return fsync(fd);
-}
-
 static ssize_t reftable_write_data(int fd, const void *data, size_t size)
 {
 	size_t total_written = 0;
@@ -69,7 +62,7 @@ static ssize_t fd_writer_write(void *arg, const void *data, size_t sz)
 static int fd_writer_flush(void *arg)
 {
 	struct fd_writer *writer = arg;
-	return stack_fsync(writer->opts, writer->fd);
+	return fsync(writer->fd);
 }
 
 static int fd_read_lines(int fd, char ***namesp)
@@ -372,45 +365,26 @@ done:
 	return err;
 }
 
-/* return negative if a before b. */
-static int tv_cmp(struct timeval *a, struct timeval *b)
-{
-	time_t diff = a->tv_sec - b->tv_sec;
-	int udiff = a->tv_usec - b->tv_usec;
-
-	if (diff != 0)
-		return diff;
-
-	return udiff;
-}
-
 static int reftable_stack_reload_maybe_reuse(struct reftable_stack *st,
 					     int reuse_open)
 {
 	char **names = NULL, **names_after = NULL;
-	struct timeval deadline;
+	uint64_t deadline;
 	int64_t delay = 0;
 	int tries = 0, err;
 	int fd = -1;
 
-	err = gettimeofday(&deadline, NULL);
-	if (err < 0)
-		goto out;
-	deadline.tv_sec += 3;
+	deadline = reftable_time_ms() + 3000;
 
 	while (1) {
-		struct timeval now;
-
-		err = gettimeofday(&now, NULL);
-		if (err < 0)
-			goto out;
+		uint64_t now = reftable_time_ms();
 
 		/*
 		 * Only look at deadlines after the first few times. This
 		 * simplifies debugging in GDB.
 		 */
 		tries++;
-		if (tries > 3 && tv_cmp(&now, &deadline) >= 0)
+		if (tries > 3 && now >= deadline)
 			goto out;
 
 		fd = open(st->list_file, O_RDONLY);
@@ -812,7 +786,7 @@ int reftable_addition_commit(struct reftable_addition *add)
 		goto done;
 	}
 
-	err = stack_fsync(&add->stack->opts, add->tables_list_lock.fd);
+	err = fsync(add->tables_list_lock.fd);
 	if (err < 0) {
 		err = REFTABLE_IO_ERROR;
 		goto done;
@@ -1480,7 +1454,7 @@ static int stack_compact_range(struct reftable_stack *st,
 		goto done;
 	}
 
-	err = stack_fsync(&st->opts, tables_list_lock.fd);
+	err = fsync(tables_list_lock.fd);
 	if (err < 0) {
 		err = REFTABLE_IO_ERROR;
 		unlink(new_table_path.buf);
@@ -1626,7 +1600,8 @@ struct segment suggest_compaction_segment(uint64_t *sizes, size_t n,
 	return seg;
 }
 
-static uint64_t *stack_table_sizes_for_compaction(struct reftable_stack *st)
+static int stack_segments_for_compaction(struct reftable_stack *st,
+					 struct segment *seg)
 {
 	int version = (st->opts.hash_id == REFTABLE_HASH_SHA1) ? 1 : 2;
 	int overhead = header_size(version) - 1;
@@ -1634,31 +1609,63 @@ static uint64_t *stack_table_sizes_for_compaction(struct reftable_stack *st)
 
 	REFTABLE_CALLOC_ARRAY(sizes, st->merged->tables_len);
 	if (!sizes)
-		return NULL;
+		return REFTABLE_OUT_OF_MEMORY_ERROR;
 
 	for (size_t i = 0; i < st->merged->tables_len; i++)
 		sizes[i] = st->tables[i]->size - overhead;
 
-	return sizes;
+	*seg = suggest_compaction_segment(sizes, st->merged->tables_len,
+					  st->opts.auto_compaction_factor);
+	reftable_free(sizes);
+
+	return 0;
+}
+
+static int update_segment_if_compaction_required(struct reftable_stack *st,
+						 struct segment *seg,
+						 bool use_geometric,
+						 bool *required)
+{
+	int err;
+
+	if (st->merged->tables_len < 2) {
+		*required = false;
+		return 0;
+	}
+
+	if (!use_geometric) {
+		*required = true;
+		return 0;
+	}
+
+	err = stack_segments_for_compaction(st, seg);
+	if (err)
+		return err;
+
+	*required = segment_size(seg) > 0;
+	return 0;
+}
+
+int reftable_stack_compaction_required(struct reftable_stack *st,
+				       bool use_heuristics,
+				       bool *required)
+{
+	struct segment seg;
+	return update_segment_if_compaction_required(st, &seg, use_heuristics,
+						     required);
 }
 
 int reftable_stack_auto_compact(struct reftable_stack *st)
 {
 	struct segment seg;
-	uint64_t *sizes;
+	bool required;
+	int err;
 
-	if (st->merged->tables_len < 2)
-		return 0;
+	err = update_segment_if_compaction_required(st, &seg, true, &required);
+	if (err)
+		return err;
 
-	sizes = stack_table_sizes_for_compaction(st);
-	if (!sizes)
-		return REFTABLE_OUT_OF_MEMORY_ERROR;
-
-	seg = suggest_compaction_segment(sizes, st->merged->tables_len,
-					 st->opts.auto_compaction_factor);
-	reftable_free(sizes);
-
-	if (segment_size(&seg) > 0)
+	if (required)
 		return stack_compact_range(st, seg.start, seg.end - 1,
 					   NULL, STACK_COMPACT_RANGE_BEST_EFFORT);
 

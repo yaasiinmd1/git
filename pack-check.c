@@ -9,6 +9,7 @@
 #include "packfile.h"
 #include "object-file.h"
 #include "odb.h"
+#include "odb/streaming.h"
 
 struct idx_entry {
 	off_t                offset;
@@ -52,6 +53,7 @@ static int verify_packfile(struct repository *r,
 			   struct packed_git *p,
 			   struct pack_window **w_curs,
 			   verify_fn fn,
+			   void *fn_data,
 			   struct progress *progress, uint32_t base_count)
 
 {
@@ -104,10 +106,11 @@ static int verify_packfile(struct repository *r,
 	QSORT(entries, nr_objects, compare_entries);
 
 	for (i = 0; i < nr_objects; i++) {
+		struct odb_read_stream *stream = NULL;
 		void *data;
 		struct object_id oid;
 		enum object_type type;
-		unsigned long size;
+		size_t size;
 		off_t curpos;
 		int data_valid;
 
@@ -140,7 +143,8 @@ static int verify_packfile(struct repository *r,
 			data = NULL;
 			data_valid = 0;
 		} else {
-			data = unpack_entry(r, p, entries[i].offset, &type, &size);
+			data = unpack_entry(r, p, entries[i].offset, &type,
+					    &size);
 			data_valid = 1;
 		}
 
@@ -152,23 +156,27 @@ static int verify_packfile(struct repository *r,
 							type) < 0)
 			err = error("packed %s from %s is corrupt",
 				    oid_to_hex(&oid), p->pack_name);
-		else if (!data && stream_object_signature(r, &oid) < 0)
+		else if (!data &&
+			 (packfile_read_object_stream(&stream, &oid, p, entries[i].offset) < 0 ||
+			  stream_object_signature(r, stream, &oid) < 0))
 			err = error("packed %s from %s is corrupt",
 				    oid_to_hex(&oid), p->pack_name);
 		else if (fn) {
 			int eaten = 0;
-			err |= fn(&oid, type, size, data, &eaten);
+			err |= fn(&oid, type, size, data, &eaten, fn_data);
 			if (eaten)
 				data = NULL;
 		}
 		if (((base_count + i) & 1023) == 0)
 			display_progress(progress, base_count + i);
-		free(data);
 
+		if (stream)
+			odb_read_stream_close(stream);
+		free(data);
 	}
+
 	display_progress(progress, base_count + i);
 	free(entries);
-
 	return err;
 }
 
@@ -186,7 +194,7 @@ int verify_pack_index(struct packed_git *p)
 	return err;
 }
 
-int verify_pack(struct repository *r, struct packed_git *p, verify_fn fn,
+int verify_pack(struct repository *r, struct packed_git *p, verify_fn fn, void *fn_data,
 		struct progress *progress, uint32_t base_count)
 {
 	int err = 0;
@@ -196,7 +204,7 @@ int verify_pack(struct repository *r, struct packed_git *p, verify_fn fn,
 	if (!p->index_data)
 		return -1;
 
-	err |= verify_packfile(r, p, &w_curs, fn, progress, base_count);
+	err |= verify_packfile(r, p, &w_curs, fn, fn_data, progress, base_count);
 	unuse_pack(&w_curs);
 
 	return err;

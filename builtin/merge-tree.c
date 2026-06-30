@@ -69,7 +69,7 @@ static const char *explanation(struct merge_list *entry)
 	return "removed in remote";
 }
 
-static void *result(struct merge_list *entry, unsigned long *size)
+static void *result(struct merge_list *entry, size_t *size)
 {
 	enum object_type type;
 	struct blob *base, *our, *their;
@@ -96,7 +96,7 @@ static void *result(struct merge_list *entry, unsigned long *size)
 			   base, our, their, size);
 }
 
-static void *origin(struct merge_list *entry, unsigned long *size)
+static void *origin(struct merge_list *entry, size_t *size)
 {
 	enum object_type type;
 	while (entry) {
@@ -119,7 +119,7 @@ static int show_outf(void *priv UNUSED, mmbuffer_t *mb, int nbuf)
 
 static void show_diff(struct merge_list *entry)
 {
-	unsigned long size;
+	size_t size;
 	mmfile_t src, dst;
 	xpparam_t xpp;
 	xdemitconf_t xecfg;
@@ -447,17 +447,20 @@ static int real_merge(struct merge_tree_options *o,
 
 		if (repo_get_oid_treeish(the_repository, merge_base, &base_oid))
 			die(_("could not parse as tree '%s'"), merge_base);
-		base_tree = parse_tree_indirect(&base_oid);
+		base_tree = repo_parse_tree_indirect(the_repository,
+						     &base_oid);
 		if (!base_tree)
 			die(_("unable to read tree (%s)"), oid_to_hex(&base_oid));
 		if (repo_get_oid_treeish(the_repository, branch1, &head_oid))
 			die(_("could not parse as tree '%s'"), branch1);
-		parent1_tree = parse_tree_indirect(&head_oid);
+		parent1_tree = repo_parse_tree_indirect(the_repository,
+							&head_oid);
 		if (!parent1_tree)
 			die(_("unable to read tree (%s)"), oid_to_hex(&head_oid));
 		if (repo_get_oid_treeish(the_repository, branch2, &merge_oid))
 			die(_("could not parse as tree '%s'"), branch2);
-		parent2_tree = parse_tree_indirect(&merge_oid);
+		parent2_tree = repo_parse_tree_indirect(the_repository,
+							&merge_oid);
 		if (!parent2_tree)
 			die(_("unable to read tree (%s)"), oid_to_hex(&merge_oid));
 
@@ -483,9 +486,9 @@ static int real_merge(struct merge_tree_options *o,
 			exit(128);
 		if (!merge_bases && !o->allow_unrelated_histories)
 			die(_("refusing to merge unrelated histories"));
-		merge_bases = reverse_commit_list(merge_bases);
+		merge_bases = commit_list_reverse(merge_bases);
 		merge_incore_recursive(&opt, merge_bases, parent1, parent2, &result);
-		free_commit_list(merge_bases);
+		commit_list_free(merge_bases);
 	}
 
 	if (result.clean < 0)

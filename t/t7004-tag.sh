@@ -33,8 +33,10 @@ test_expect_success 'listing all tags in an empty tree should succeed' '
 '
 
 test_expect_success 'listing all tags in an empty tree should output nothing' '
-	test $(git tag -l | wc -l) -eq 0 &&
-	test $(git tag | wc -l) -eq 0
+	git tag -l >actual &&
+	test_must_be_empty actual &&
+	git tag >actual &&
+	test_must_be_empty actual
 '
 
 test_expect_success 'sort tags, ignore case' '
@@ -143,9 +145,7 @@ test_expect_success 'listing all tags if one exists should succeed' '
 '
 
 test_expect_success 'Multiple -l or --list options are equivalent to one -l option' '
-	cat >expect <<-\EOF &&
-	mytag
-	EOF
+	git tag -l >expect &&
 	git tag -l -l >actual &&
 	test_cmp expect actual &&
 	git tag --list --list >actual &&
@@ -155,8 +155,10 @@ test_expect_success 'Multiple -l or --list options are equivalent to one -l opti
 '
 
 test_expect_success 'listing all tags if one exists should output that tag' '
-	test $(git tag -l) = mytag &&
-	test $(git tag) = mytag
+	git tag -l >actual &&
+	test_grep "^mytag$" actual &&
+	git tag >actual &&
+	test_grep "^mytag$" actual
 '
 
 # pattern matching:
@@ -166,11 +168,15 @@ test_expect_success 'listing a tag using a matching pattern should succeed' '
 '
 
 test_expect_success 'listing a tag with --ignore-case' '
-	test $(git tag -l --ignore-case MYTAG) = mytag
+	echo mytag >expect &&
+	git tag -l --ignore-case MYTAG >actual &&
+	test_cmp expect actual
 '
 
 test_expect_success 'listing a tag using a matching pattern should output that tag' '
-	test $(git tag -l mytag) = mytag
+	echo mytag >expect &&
+	git tag -l mytag >actual &&
+	test_cmp expect actual
 '
 
 test_expect_success 'listing tags using a non-matching pattern should succeed' '
@@ -178,7 +184,8 @@ test_expect_success 'listing tags using a non-matching pattern should succeed' '
 '
 
 test_expect_success 'listing tags using a non-matching pattern should output nothing' '
-	test $(git tag -l xxx | wc -l) -eq 0
+	git tag -l xxx >actual &&
+	test_must_be_empty actual
 '
 
 # special cases for creating tags:
@@ -188,13 +195,14 @@ test_expect_success 'trying to create a tag with the name of one existing should
 '
 
 test_expect_success 'trying to create a tag with a non-valid name should fail' '
-	test $(git tag -l | wc -l) -eq 1 &&
+	git tag -l >tags-before &&
 	test_must_fail git tag "" &&
 	test_must_fail git tag .othertag &&
 	test_must_fail git tag "other tag" &&
 	test_must_fail git tag "othertag^" &&
 	test_must_fail git tag "other~tag" &&
-	test $(git tag -l | wc -l) -eq 1
+	git tag -l >tags-after &&
+	test_cmp tags-before tags-after
 '
 
 test_expect_success 'creating a tag using HEAD directly should succeed' '
@@ -222,12 +230,7 @@ test_expect_success 'trying to delete an unknown tag should fail' '
 '
 
 test_expect_success 'trying to delete tags without params should succeed and do nothing' '
-	cat >expect <<-\EOF &&
-	myhead
-	mytag
-	EOF
-	git tag -l >actual &&
-	test_cmp expect actual &&
+	git tag -l >expect &&
 	git tag -d &&
 	git tag -l >actual &&
 	test_cmp expect actual
@@ -433,8 +436,12 @@ test_expect_success 'listing tags -n in column with column.ui ignored' '
 
 test_expect_success 'a non-annotated tag created without parameters should point to HEAD' '
 	git tag non-annotated-tag &&
-	test $(git cat-file -t non-annotated-tag) = commit &&
-	test $(git rev-parse non-annotated-tag) = $(git rev-parse HEAD)
+	echo commit >expect &&
+	git cat-file -t non-annotated-tag >actual &&
+	test_cmp expect actual &&
+	git rev-parse HEAD >expect &&
+	git rev-parse non-annotated-tag >actual &&
+	test_cmp expect actual
 '
 
 test_expect_success 'trying to verify an unknown tag should fail' '
@@ -1523,11 +1530,11 @@ test_expect_success GPG 'verify signed tag fails when public key is not present'
 '
 
 test_expect_success 'git tag -a fails if tag annotation is empty' '
-	! (GIT_EDITOR=cat git tag -a initial-comment)
+	test_must_fail env GIT_EDITOR=cat git tag -a initial-comment
 '
 
 test_expect_success 'message in editor has initial comment' '
-	! (GIT_EDITOR=cat git tag -a initial-comment >actual)
+	test_must_fail env GIT_EDITOR=cat git tag -a initial-comment >actual
 '
 
 test_expect_success 'message in editor has initial comment: first line' '
@@ -2293,24 +2300,26 @@ test_expect_success '--contains combined with --no-contains' '
 # don't recurse down to tags for trees or blobs pointed to by *those*
 # commits.
 test_expect_success 'Does --[no-]contains stop at commits? Yes!' '
-	cd no-contains &&
-	blob=$(git rev-parse v0.3:v0.3.t) &&
-	tree=$(git rev-parse v0.3^{tree}) &&
-	git tag tag-blob $blob &&
-	git tag tag-tree $tree &&
-	git tag --contains v0.3 >actual &&
-	cat >expected <<-\EOF &&
-	v0.3
-	v0.4
-	v0.5
-	EOF
-	test_cmp expected actual &&
-	git tag --no-contains v0.3 >actual &&
-	cat >expected <<-\EOF &&
-	v0.1
-	v0.2
-	EOF
-	test_cmp expected actual
+	(
+		cd no-contains &&
+		blob=$(git rev-parse v0.3:v0.3.t) &&
+		tree=$(git rev-parse v0.3^{tree}) &&
+		git tag tag-blob $blob &&
+		git tag tag-tree $tree &&
+		git tag --contains v0.3 >actual &&
+		cat >expected <<-\EOF &&
+		v0.3
+		v0.4
+		v0.5
+		EOF
+		test_cmp expected actual &&
+		git tag --no-contains v0.3 >actual &&
+		cat >expected <<-\EOF &&
+		v0.1
+		v0.2
+		EOF
+		test_cmp expected actual
+	)
 '
 
 test_expect_success 'If tag is created then tag message file is unlinked' '
@@ -2330,6 +2339,26 @@ test_expect_success 'If tag cannot be created then tag message file is not unlin
 	git tag foo/bar &&
 	test_must_fail env GIT_EDITOR=./fakeeditor git tag -a foo &&
 	test_path_exists .git/TAG_EDITMSG
+'
+
+test_expect_success 'annotated tag version sort' '
+	git tag -a -m "sample 1.0" vsample-1.0 &&
+	git tag -a -m "sample 2.0" vsample-2.0 &&
+	git tag -a -m "sample 10.0" vsample-10.0 &&
+	cat >expect <<-EOF &&
+	vsample-1.0
+	vsample-2.0
+	vsample-10.0
+	EOF
+
+	git tag --list --sort=version:tag vsample-\* >actual &&
+	test_cmp expect actual &&
+
+	# Ensure that we also handle this case alright in the case we have the
+	# peeled values cached e.g. via the packed-refs file.
+	git pack-refs --all &&
+	git tag --list --sort=version:tag vsample-\* &&
+	test_cmp expect actual
 '
 
 test_done

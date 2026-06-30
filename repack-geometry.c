@@ -4,6 +4,7 @@
 #include "repack.h"
 #include "repository.h"
 #include "hex.h"
+#include "midx.h"
 #include "packfile.h"
 
 static uint32_t pack_geometry_weight(struct packed_git *p)
@@ -31,8 +32,28 @@ void pack_geometry_init(struct pack_geometry *geometry,
 {
 	struct packed_git *p;
 	struct strbuf buf = STRBUF_INIT;
+	struct multi_pack_index *m = get_multi_pack_index(existing->source);
 
 	repo_for_each_pack(existing->repo, p) {
+		if (geometry->midx_layer_threshold_set && m &&
+		    p->multi_pack_index) {
+			/*
+			 * When writing MIDX layers incrementally,
+			 * ignore packs unless they are in the most
+			 * recent MIDX layer *and* there are at least
+			 * 'midx_layer_threshold' packs in that layer.
+			 *
+			 * Otherwise 'p' is either in an older layer, or
+			 * the youngest layer does not have enough packs
+			 * to consider its packs as candidates for
+			 * repacking. In either of those cases we want
+			 * to ignore the pack.
+			 */
+			if (m->num_packs < geometry->midx_layer_threshold ||
+			    !midx_layer_contains_pack(m, pack_basename(p)))
+				continue;
+		}
+
 		if (args->local && !p->pack_local)
 			/*
 			 * When asked to only repack local packfiles we skip
@@ -66,45 +87,54 @@ void pack_geometry_init(struct pack_geometry *geometry,
 		if (p->is_cruft)
 			continue;
 
-		ALLOC_GROW(geometry->pack,
-			   geometry->pack_nr + 1,
-			   geometry->pack_alloc);
+		if (p->pack_promisor) {
+			ALLOC_GROW(geometry->promisor_pack,
+				   geometry->promisor_pack_nr + 1,
+				   geometry->promisor_pack_alloc);
 
-		geometry->pack[geometry->pack_nr] = p;
-		geometry->pack_nr++;
+			geometry->promisor_pack[geometry->promisor_pack_nr] = p;
+			geometry->promisor_pack_nr++;
+		} else {
+			ALLOC_GROW(geometry->pack,
+				   geometry->pack_nr + 1,
+				   geometry->pack_alloc);
+
+			geometry->pack[geometry->pack_nr] = p;
+			geometry->pack_nr++;
+		}
 	}
 
 	QSORT(geometry->pack, geometry->pack_nr, pack_geometry_cmp);
+	QSORT(geometry->promisor_pack, geometry->promisor_pack_nr, pack_geometry_cmp);
 	strbuf_release(&buf);
 }
 
-void pack_geometry_split(struct pack_geometry *geometry)
+static uint32_t compute_pack_geometry_split(struct packed_git **pack, size_t pack_nr,
+					    int split_factor)
 {
 	uint32_t i;
 	uint32_t split;
 	off_t total_size = 0;
 
-	if (!geometry->pack_nr) {
-		geometry->split = geometry->pack_nr;
-		return;
-	}
+	if (!pack_nr)
+		return 0;
 
 	/*
 	 * First, count the number of packs (in descending order of size) which
 	 * already form a geometric progression.
 	 */
-	for (i = geometry->pack_nr - 1; i > 0; i--) {
-		struct packed_git *ours = geometry->pack[i];
-		struct packed_git *prev = geometry->pack[i - 1];
+	for (i = pack_nr - 1; i > 0; i--) {
+		struct packed_git *ours = pack[i];
+		struct packed_git *prev = pack[i - 1];
 
-		if (unsigned_mult_overflows(geometry->split_factor,
+		if (unsigned_mult_overflows(split_factor,
 					    pack_geometry_weight(prev)))
 			die(_("pack %s too large to consider in geometric "
 			      "progression"),
 			    prev->pack_name);
 
 		if (pack_geometry_weight(ours) <
-		    geometry->split_factor * pack_geometry_weight(prev))
+		    split_factor * pack_geometry_weight(prev))
 			break;
 	}
 
@@ -130,21 +160,19 @@ void pack_geometry_split(struct pack_geometry *geometry)
 	 * the geometric progression.
 	 */
 	for (i = 0; i < split; i++) {
-		struct packed_git *p = geometry->pack[i];
+		struct packed_git *p = pack[i];
 
 		if (unsigned_add_overflows(total_size, pack_geometry_weight(p)))
 			die(_("pack %s too large to roll up"), p->pack_name);
 		total_size += pack_geometry_weight(p);
 	}
-	for (i = split; i < geometry->pack_nr; i++) {
-		struct packed_git *ours = geometry->pack[i];
+	for (i = split; i < pack_nr; i++) {
+		struct packed_git *ours = pack[i];
 
-		if (unsigned_mult_overflows(geometry->split_factor,
-					    total_size))
+		if (unsigned_mult_overflows(split_factor, total_size))
 			die(_("pack %s too large to roll up"), ours->pack_name);
 
-		if (pack_geometry_weight(ours) <
-		    geometry->split_factor * total_size) {
+		if (pack_geometry_weight(ours) < split_factor * total_size) {
 			if (unsigned_add_overflows(total_size,
 						   pack_geometry_weight(ours)))
 				die(_("pack %s too large to roll up"),
@@ -156,7 +184,30 @@ void pack_geometry_split(struct pack_geometry *geometry)
 			break;
 	}
 
-	geometry->split = split;
+	return split;
+}
+
+void pack_geometry_split(struct pack_geometry *geometry)
+{
+	geometry->split = compute_pack_geometry_split(geometry->pack, geometry->pack_nr,
+						      geometry->split_factor);
+	geometry->promisor_split = compute_pack_geometry_split(geometry->promisor_pack,
+							       geometry->promisor_pack_nr,
+							       geometry->split_factor);
+	for (uint32_t i = 0; i < geometry->split; i++) {
+		struct packed_git *p = geometry->pack[i];
+		/*
+		 * During incremental MIDX/bitmap repacking, any packs
+		 * included in the rollup are either (a) not MIDX'd, or
+		 * (b) contained in the tip layer iff it has at least
+		 * the threshold number of packs.
+		 *
+		 * In the latter case, we can safely conclude that the
+		 * tip of the MIDX chain will be rewritten.
+		 */
+		if (p->multi_pack_index)
+			geometry->midx_tip_rewritten = true;
+	}
 }
 
 struct packed_git *pack_geometry_preferred_pack(struct pack_geometry *geometry)
@@ -194,17 +245,19 @@ struct packed_git *pack_geometry_preferred_pack(struct pack_geometry *geometry)
 	return NULL;
 }
 
-void pack_geometry_remove_redundant(struct pack_geometry *geometry,
-				    struct string_list *names,
-				    struct existing_packs *existing,
-				    const char *packdir)
+static void remove_redundant_packs(struct packed_git **pack,
+				   uint32_t pack_nr,
+				   struct string_list *names,
+				   struct existing_packs *existing,
+				   const char *packdir,
+				   bool wrote_incremental_midx)
 {
 	const struct git_hash_algo *algop = existing->repo->hash_algo;
 	struct strbuf buf = STRBUF_INIT;
 	uint32_t i;
 
-	for (i = 0; i < geometry->split; i++) {
-		struct packed_git *p = geometry->pack[i];
+	for (i = 0; i < pack_nr; i++) {
+		struct packed_git *p = pack[i];
 		if (string_list_has_string(names, hash_to_hex_algop(p->hash,
 								    algop)))
 			continue;
@@ -217,10 +270,23 @@ void pack_geometry_remove_redundant(struct pack_geometry *geometry,
 		    (string_list_has_string(&existing->kept_packs, buf.buf)))
 			continue;
 
-		repack_remove_redundant_pack(existing->repo, packdir, buf.buf);
+		repack_remove_redundant_pack(existing->repo, packdir, buf.buf,
+					     wrote_incremental_midx);
 	}
 
 	strbuf_release(&buf);
+}
+
+void pack_geometry_remove_redundant(struct pack_geometry *geometry,
+				    struct string_list *names,
+				    struct existing_packs *existing,
+				    const char *packdir,
+				    bool wrote_incremental_midx)
+{
+	remove_redundant_packs(geometry->pack, geometry->split,
+			       names, existing, packdir, wrote_incremental_midx);
+	remove_redundant_packs(geometry->promisor_pack, geometry->promisor_split,
+			       names, existing, packdir, wrote_incremental_midx);
 }
 
 void pack_geometry_release(struct pack_geometry *geometry)
@@ -229,4 +295,5 @@ void pack_geometry_release(struct pack_geometry *geometry)
 		return;
 
 	free(geometry->pack);
+	free(geometry->promisor_pack);
 }

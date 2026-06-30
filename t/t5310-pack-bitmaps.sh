@@ -242,7 +242,7 @@ test_bitmap_cases () {
 	'
 
 	test_expect_success 'splitting packs does not generate bogus bitmaps' '
-		test-tool genrandom foo $((1024 * 1024)) >rand &&
+		test-tool genrandom foo 1m >rand &&
 		git add rand &&
 		git commit -m "commit with big file" &&
 		git -c pack.packSizeLimit=500k repack -adb &&
@@ -466,6 +466,47 @@ test_bitmap_cases () {
 		)
 	'
 
+	test_expect_success 'pack.preferBitmapTips interprets patterns as hierarchy' '
+		git init repo &&
+		test_when_finished "rm -fr repo" &&
+		(
+			cd repo &&
+
+			# Create enough commits that not all will receive bitmap
+			# coverage even if they are all at the tip of some reference.
+			test_commit_bulk --message="%s" 103 &&
+			git log --format="create refs/tags/%s/tag %H" HEAD >refs &&
+			git update-ref --stdin <refs &&
+
+			# Create the bitmap.
+			git repack -adb &&
+			test-tool bitmap list-commits | sort >commits-with-bitmap &&
+
+			# Verify that we have at least one commit that did not
+			# receive a bitmap.
+			git rev-list HEAD >commits.raw &&
+			sort <commits.raw >commits &&
+			comm -13 commits-with-bitmap commits >commits-wo-bitmap &&
+			test_file_not_empty commits-wo-bitmap &&
+			commit_id=$(head commits-wo-bitmap) &&
+			ref_without_bitmap=$(git for-each-ref --points-at="$commit_id" --format="%(refname)") &&
+
+			# When passing the full refname we do not expect a
+			# bitmap to be generated, as it should be interpreted
+			# as if a slash was appended to the pattern.
+			git -c pack.preferBitmapTips="$ref_without_bitmap" repack -adb &&
+			test-tool bitmap list-commits >after &&
+			test_grep ! "$commit_id" after &&
+
+			# But if we pass the parent directory of the ref we
+			# should see a bitmap.
+			ref_namespace=$(dirname "$ref_without_bitmap") &&
+			git -c pack.preferBitmapTips="$ref_namespace" repack -adb &&
+			test-tool bitmap list-commits >after &&
+			test_grep "$commit_id" after
+		)
+	'
+
 	test_expect_success 'complains about multiple pack bitmaps' '
 		rm -fr repo &&
 		git init repo &&
@@ -605,6 +646,30 @@ test_expect_success 'truncated bitmap fails gracefully (lookup table)' '
 	git rev-list --use-bitmap-index --count --all >actual 2>stderr &&
 	test_cmp expect actual &&
 	test_grep corrupted.bitmap.index stderr
+'
+
+test_expect_success 'test-tool bitmap write determines bitmap selection' '
+	test_when_finished "rm -fr bitmap-write-helper" &&
+	git init bitmap-write-helper &&
+	(
+		cd bitmap-write-helper &&
+
+		test_commit_bulk 64 &&
+		git repack -ad &&
+
+		pack="$(ls .git/objects/pack/pack-*.pack)" &&
+
+		git rev-parse HEAD >in &&
+		test-tool bitmap write "$(basename $pack)" <in &&
+
+		test-tool bitmap list-commits >bitmaps.raw &&
+		sort bitmaps.raw >bitmaps &&
+		test_cmp in bitmaps &&
+
+		git rev-list --count --objects --use-bitmap-index HEAD >actual &&
+		git rev-list --count --objects HEAD >expect &&
+		test_cmp expect actual
+	)
 '
 
 test_done

@@ -240,6 +240,12 @@ struct string_list_item *string_list_append_nodup(struct string_list *list, char
 void string_list_sort(struct string_list *list);
 
 /**
+ * Sort the list and then remove duplicate entries.  If free_util is true,
+ * call free() on the util members of any items that have to be deleted.
+ */
+void string_list_sort_u(struct string_list *list, int free_util);
+
+/**
  * Like `string_list_has_string()` but for unsorted lists. Linear in
  * size of the list.
  */
@@ -258,6 +264,14 @@ struct string_list_item *unsorted_string_list_lookup(struct string_list *list,
  * pointer of the items should be freed or not.
  */
 void unsorted_string_list_delete_item(struct string_list *list, int i, int free_util);
+
+/**
+ * Remove the first item matching `str` from an unsorted string_list.
+ * No-op if `str` is not found. If `free_util` is non-zero, the `util`
+ * pointer of the removed item is freed before deletion.
+ */
+void unsorted_string_list_remove(struct string_list *list, const char *str,
+				 int free_util);
 
 /**
  * Split string into substrings on characters in `delim` and append the

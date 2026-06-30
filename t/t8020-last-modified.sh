@@ -8,12 +8,9 @@ test_expect_success 'setup' '
 	test_commit 1 file &&
 	mkdir a &&
 	test_commit 2 a/file &&
+	git tag -mA t2 2 &&
 	mkdir a/b &&
 	test_commit 3 a/b/file
-'
-
-test_expect_success 'cannot run last-modified on two trees' '
-	test_must_fail git last-modified HEAD HEAD~1
 '
 
 check_last_modified() {
@@ -34,7 +31,7 @@ check_last_modified() {
 
 	cat >expect &&
 	git ${indir:+-C "$indir"} last-modified "$@" >tmp.1 &&
-	git name-rev --annotate-stdin --name-only --tags \
+	git name-rev --annotate-stdin --name-only --tags --exclude=t2 \
 		<tmp.1 >tmp.2 &&
 	tr '\t' ' ' <tmp.2 >actual &&
 	test_cmp expect actual
@@ -55,11 +52,18 @@ test_expect_success 'last-modified recursive' '
 	EOF
 '
 
+test_expect_success 'last-modified on annotated tag' '
+	check_last_modified t2 <<-\EOF
+	2 a
+	1 file
+	EOF
+'
+
 test_expect_success 'last-modified recursive with show-trees' '
 	check_last_modified -r -t <<-\EOF
-	3 a
 	3 a/b
 	3 a/b/file
+	3 a
 	2 a/file
 	1 file
 	EOF
@@ -78,10 +82,53 @@ test_expect_success 'last-modified subdir' '
 	EOF
 '
 
+test_expect_success 'last-modified in sparse checkout' '
+	test_when_finished "git sparse-checkout disable" &&
+	git sparse-checkout set b &&
+	check_last_modified -- a <<-\EOF
+	3 a
+	EOF
+'
+
 test_expect_success 'last-modified subdir recursive' '
 	check_last_modified -r a <<-\EOF
 	3 a/b/file
 	2 a/file
+	EOF
+'
+
+test_expect_success 'last-modified subdir non-recursive' '
+	check_last_modified a <<-\EOF
+	3 a
+	EOF
+'
+
+test_expect_success 'last-modified path in subdir non-recursive' '
+	check_last_modified a/file <<-\EOF
+	2 a/file
+	EOF
+'
+
+test_expect_success 'last-modified subdir with wildcard non-recursive' '
+	check_last_modified a/* <<-\EOF
+	3 a/b
+	2 a/file
+	EOF
+'
+
+test_expect_success 'last-modified with negative max-depth' '
+	check_last_modified --max-depth=-1 <<-\EOF
+	3 a/b/file
+	2 a/file
+	1 file
+	EOF
+'
+
+test_expect_success 'last-modified with max-depth of 1' '
+	check_last_modified --max-depth=1 <<-\EOF
+	3 a/b
+	2 a/file
+	1 file
 	EOF
 '
 
@@ -222,9 +269,19 @@ test_expect_success 'last-modified merge undoes changes' '
 	EOF
 '
 
+test_expect_success 'cannot run last-modified on two commits' '
+	test_must_fail git last-modified HEAD HEAD~1 2>err &&
+	test_grep "last-modified can only operate on one commit at a time" err
+'
+
 test_expect_success 'last-modified complains about unknown arguments' '
 	test_must_fail git last-modified --foo 2>err &&
-	grep "unknown last-modified argument: --foo" err
+	test_grep "unknown last-modified argument: --foo" err
+'
+
+test_expect_success 'last-modified expects commit-ish' '
+	test_must_fail git last-modified HEAD^{tree} 2>err &&
+	test_grep "revision argument ${SQ}HEAD^{tree}${SQ} is a tree, not a commit-ish" err
 '
 
 test_done

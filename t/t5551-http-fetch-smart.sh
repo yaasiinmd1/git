@@ -333,12 +333,12 @@ test_expect_success 'dumb clone via http-backend respects namespace' '
 
 test_expect_success 'cookies stored in http.cookiefile when http.savecookies set' '
 	cat >cookies.txt <<-\EOF &&
-	127.0.0.1	FALSE	/smart_cookies/	FALSE	0	othername	othervalue
+	127.0.0.1	FALSE	/smart_cookies	FALSE	0	othername	othervalue
 	EOF
 	sort >expect_cookies.txt <<-\EOF &&
-	127.0.0.1	FALSE	/smart_cookies/	FALSE	0	othername	othervalue
-	127.0.0.1	FALSE	/smart_cookies/repo.git/	FALSE	0	name	value
-	127.0.0.1	FALSE	/smart_cookies/repo.git/info/	FALSE	0	name	value
+	127.0.0.1	FALSE	/smart_cookies	FALSE	0	othername	othervalue
+	127.0.0.1	FALSE	/smart_cookies/repo.git	FALSE	0	name	value
+	127.0.0.1	FALSE	/smart_cookies/repo.git/info	FALSE	0	name	value
 	EOF
 	git config http.cookiefile cookies.txt &&
 	git config http.savecookies true &&
@@ -351,8 +351,11 @@ test_expect_success 'cookies stored in http.cookiefile when http.savecookies set
 		tag -m "foo" cookie-tag &&
 	git fetch $HTTPD_URL/smart_cookies/repo.git cookie-tag &&
 
-	grep "^[^#]" cookies.txt | sort >cookies_stripped.txt &&
-	test_cmp expect_cookies.txt cookies_stripped.txt
+	# Strip trailing slashes from cookie paths to handle output from both
+	# old curl ("/smart_cookies/") and new ("/smart_cookies").
+	HT="	" &&
+	grep "^[^#]" cookies.txt | sed "s,/$HT,$HT," | sort >cookies_clean.txt &&
+	test_cmp expect_cookies.txt cookies_clean.txt
 '
 
 test_expect_success 'transfer.hiderefs works over smart-http' '
@@ -394,15 +397,16 @@ create_tags () {
 }
 
 test_expect_success 'create 2,000 tags in the repo' '
+	git init --bare "$HTTPD_DOCUMENT_ROOT_PATH/many-tags.git" &&
 	(
-		cd "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" &&
+		cd "$HTTPD_DOCUMENT_ROOT_PATH/many-tags.git" &&
 		create_tags 1 2000
 	)
 '
 
 test_expect_success CMDLINE_LIMIT \
 	'clone the 2,000 tag repo to check OS command line overflow' '
-	run_with_limited_cmdline git clone $HTTPD_URL/smart/repo.git too-many-refs &&
+	run_with_limited_cmdline git clone $HTTPD_URL/smart/many-tags.git too-many-refs &&
 	(
 		cd too-many-refs &&
 		git for-each-ref refs/tags >actual &&
@@ -478,13 +482,14 @@ test_expect_success 'test allowanysha1inwant with unreachable' '
 '
 
 test_expect_success EXPENSIVE 'http can handle enormous ref negotiation' '
+	test_when_finished "rm -f tags" &&
 	(
-		cd "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" &&
+		cd "$HTTPD_DOCUMENT_ROOT_PATH/many-tags.git" &&
 		create_tags 2001 50000
 	) &&
 	git -C too-many-refs fetch -q --tags &&
 	(
-		cd "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" &&
+		cd "$HTTPD_DOCUMENT_ROOT_PATH/many-tags.git" &&
 		create_tags 50001 100000
 	) &&
 	git -C too-many-refs fetch -q --tags &&
@@ -777,6 +782,13 @@ test_expect_success 'tag following always works over v0 http' '
 	git -C "$upstream" for-each-ref refs/tags >expect &&
 	git -C tags for-each-ref >actual &&
 	test_cmp expect actual
+'
+
+test_expect_success 'ls-remote outside repo does not segfault with fetch refspec' '
+	nongit git \
+		-c remote.origin.url="$HTTPD_URL/smart/repo.git" \
+		-c remote.origin.fetch=anything \
+		ls-remote origin
 '
 
 test_done

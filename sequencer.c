@@ -209,6 +209,7 @@ static GIT_PATH_FUNC(rebase_path_reschedule_failed_exec, "rebase-merge/reschedul
 static GIT_PATH_FUNC(rebase_path_no_reschedule_failed_exec, "rebase-merge/no-reschedule-failed-exec")
 static GIT_PATH_FUNC(rebase_path_drop_redundant_commits, "rebase-merge/drop_redundant_commits")
 static GIT_PATH_FUNC(rebase_path_keep_redundant_commits, "rebase-merge/keep_redundant_commits")
+static GIT_PATH_FUNC(rebase_path_trailer, "rebase-merge/trailer")
 
 /*
  * A 'struct replay_ctx' represents the private state of the sequencer.
@@ -420,6 +421,7 @@ void replay_opts_release(struct replay_opts *opts)
 	if (opts->revs)
 		release_revisions(opts->revs);
 	free(opts->revs);
+	strvec_clear(&opts->trailer_args);
 	replay_ctx_release(ctx);
 	free(opts->ctx);
 }
@@ -767,7 +769,7 @@ static int do_recursive_merge(struct repository *r,
 		o.buffer_output = 2;
 	o.show_rename_progress = 1;
 
-	head_tree = parse_tree_indirect(head);
+	head_tree = repo_parse_tree_indirect(the_repository, head);
 	if (!head_tree)
 		return error(_("unable to read tree (%s)"), oid_to_hex(head));
 	next_tree = next ? repo_get_commit_tree(r, next) : empty_tree(r);
@@ -1292,32 +1294,40 @@ int update_head_with_reflog(const struct commit *old_head,
 	return ret;
 }
 
+static int pipe_from_strbuf(int hook_stdin_fd, void *pp_cb, void *pp_task_cb UNUSED)
+{
+	struct hook_cb_data *hook_cb = pp_cb;
+	struct strbuf *to_pipe = hook_cb->options->feed_pipe_ctx;
+	int ret;
+
+	if (!to_pipe)
+		BUG("pipe_from_strbuf called without feed_pipe_ctx");
+
+	ret = write_in_full(hook_stdin_fd, to_pipe->buf, to_pipe->len);
+	if (ret < 0 && errno != EPIPE)
+		return ret;
+
+	return 1; /* done writing */
+}
+
 static int run_rewrite_hook(const struct object_id *oldoid,
 			    const struct object_id *newoid)
 {
-	struct child_process proc = CHILD_PROCESS_INIT;
+	struct run_hooks_opt opt = RUN_HOOKS_OPT_INIT;
 	int code;
 	struct strbuf sb = STRBUF_INIT;
-	const char *hook_path = find_hook(the_repository, "post-rewrite");
 
-	if (!hook_path)
-		return 0;
-
-	strvec_pushl(&proc.args, hook_path, "amend", NULL);
-	proc.in = -1;
-	proc.stdout_to_stderr = 1;
-	proc.trace2_hook_name = "post-rewrite";
-
-	code = start_command(&proc);
-	if (code)
-		return code;
 	strbuf_addf(&sb, "%s %s\n", oid_to_hex(oldoid), oid_to_hex(newoid));
-	sigchain_push(SIGPIPE, SIG_IGN);
-	write_in_full(proc.in, sb.buf, sb.len);
-	close(proc.in);
+
+	opt.feed_pipe_ctx = &sb;
+	opt.feed_pipe = pipe_from_strbuf;
+
+	strvec_push(&opt.args, "amend");
+
+	code = run_hooks_opt(the_repository, "post-rewrite", &opt);
+
 	strbuf_release(&sb);
-	sigchain_pop(SIGPIPE);
-	return finish_command(&proc);
+	return code;
 }
 
 void commit_post_rewrite(struct repository *r,
@@ -1558,7 +1568,7 @@ static int try_to_commit(struct repository *r,
 			res = error(_("unable to parse commit author"));
 			goto out;
 		}
-		parents = copy_commit_list(current_head->parents);
+		parents = commit_list_copy(current_head->parents);
 		extra = read_commit_extra_headers(current_head, exclude_gpgsig);
 	} else if (current_head &&
 		   (!(flags & CREATE_ROOT_COMMIT) || (flags & AMEND_MSG))) {
@@ -1690,7 +1700,7 @@ static int try_to_commit(struct repository *r,
 
 out:
 	free_commit_extra_headers(extra);
-	free_commit_list(parents);
+	commit_list_free(parents);
 	strbuf_release(&err);
 	strbuf_release(&commit_msg);
 	free(amend_author);
@@ -2019,11 +2029,14 @@ static int append_squash_message(struct strbuf *buf, const char *body,
 	if (is_fixup_flag(command, flag) && !seen_squash(ctx)) {
 		/*
 		 * We're replacing the commit message so we need to
-		 * append the Signed-off-by: trailer if the user
-		 * requested '--signoff'.
+		 * append any trailers if the user requested
+		 * '--signoff' or '--trailer'.
 		 */
 		if (opts->signoff)
 			append_signoff(buf, 0, 0);
+
+		if (opts->trailer_args.nr)
+			amend_strbuf_with_trailers(buf, &opts->trailer_args);
 
 		if ((command == TODO_FIXUP) &&
 		    (flag & TODO_REPLACE_FIXUP_MSG) &&
@@ -2198,18 +2211,19 @@ static int should_edit(struct replay_opts *opts) {
 	return opts->edit;
 }
 
-static void refer_to_commit(struct replay_opts *opts,
-			    struct strbuf *msgbuf, struct commit *commit)
+static void refer_to_commit(struct repository *r, struct strbuf *msgbuf,
+			    const struct commit *commit,
+			    bool use_commit_reference)
 {
-	if (opts->commit_use_reference) {
+	if (use_commit_reference) {
 		struct pretty_print_context ctx = {
 			.abbrev = DEFAULT_ABBREV,
 			.date_mode.type = DATE_SHORT,
 		};
-		repo_format_commit_message(the_repository, commit,
+		repo_format_commit_message(r, commit,
 					   "%h (%s, %ad)", msgbuf, &ctx);
 	} else {
-		strbuf_addstr(msgbuf, oid_to_hex(&commit->object.oid));
+		strbuf_add_oid_hex(msgbuf, &commit->object.oid);
 	}
 }
 
@@ -2356,38 +2370,14 @@ static int do_pick_commit(struct repository *r,
 	 */
 
 	if (command == TODO_REVERT) {
-		const char *orig_subject;
-
 		base = commit;
 		base_label = msg.label;
 		next = parent;
 		next_label = msg.parent_label;
-		if (opts->commit_use_reference) {
-			strbuf_commented_addf(&ctx->message, comment_line_str,
-				"*** SAY WHY WE ARE REVERTING ON THE TITLE LINE ***");
-		} else if (skip_prefix(msg.subject, "Revert \"", &orig_subject) &&
-			   /*
-			    * We don't touch pre-existing repeated reverts, because
-			    * theoretically these can be nested arbitrarily deeply,
-			    * thus requiring excessive complexity to deal with.
-			    */
-			   !starts_with(orig_subject, "Revert \"")) {
-			strbuf_addstr(&ctx->message, "Reapply \"");
-			strbuf_addstr(&ctx->message, orig_subject);
-			strbuf_addstr(&ctx->message, "\n");
-		} else {
-			strbuf_addstr(&ctx->message, "Revert \"");
-			strbuf_addstr(&ctx->message, msg.subject);
-			strbuf_addstr(&ctx->message, "\"\n");
-		}
-		strbuf_addstr(&ctx->message, "\nThis reverts commit ");
-		refer_to_commit(opts, &ctx->message, commit);
-
-		if (commit->parents && commit->parents->next) {
-			strbuf_addstr(&ctx->message, ", reversing\nchanges made to ");
-			refer_to_commit(opts, &ctx->message, parent);
-		}
-		strbuf_addstr(&ctx->message, ".\n");
+		sequencer_format_revert_message(r, msg.subject, commit,
+						parent,
+						opts->commit_use_reference,
+						&ctx->message);
 	} else {
 		const char *p;
 
@@ -2405,7 +2395,7 @@ static int do_pick_commit(struct repository *r,
 			if (!has_conforming_footer(&ctx->message, NULL, 0))
 				strbuf_addch(&ctx->message, '\n');
 			strbuf_addstr(&ctx->message, cherry_picked_prefix);
-			strbuf_addstr(&ctx->message, oid_to_hex(&commit->object.oid));
+			strbuf_add_oid_hex(&ctx->message, &commit->object.oid);
 			strbuf_addstr(&ctx->message, ")\n");
 		}
 		if (!is_fixup(command))
@@ -2443,6 +2433,9 @@ static int do_pick_commit(struct repository *r,
 	if (opts->signoff && !is_fixup(command))
 		append_signoff(&ctx->message, 0, 0);
 
+	if (opts->trailer_args.nr && !is_fixup(command))
+		amend_strbuf_with_trailers(&ctx->message, &opts->trailer_args);
+
 	if (is_rebase_i(opts) && write_author_script(msg.message) < 0)
 		res = -1;
 	else if (!opts->strategy ||
@@ -2468,8 +2461,8 @@ static int do_pick_commit(struct repository *r,
 		res |= try_merge_command(r, opts->strategy,
 					 opts->xopts.nr, opts->xopts.v,
 					common, oid_to_hex(&head), remotes);
-		free_commit_list(common);
-		free_commit_list(remotes);
+		commit_list_free(common);
+		commit_list_free(remotes);
 	}
 
 	/*
@@ -3172,6 +3165,33 @@ static void read_strategy_opts(struct replay_opts *opts, struct strbuf *buf)
 	parse_strategy_opts(opts, buf->buf);
 }
 
+static int read_trailers(struct replay_opts *opts, struct strbuf *buf)
+{
+	ssize_t len;
+
+	strbuf_reset(buf);
+	len = strbuf_read_file(buf, rebase_path_trailer(), 0);
+	if (len > 0) {
+		char *p = buf->buf, *nl;
+
+		trailer_config_init();
+
+		while ((nl = strchr(p, '\n'))) {
+			*nl = '\0';
+			if (!*p)
+				return error(_("trailers file contains empty line"));
+			strvec_push(&opts->trailer_args, p);
+			p = nl + 1;
+		}
+	} else if (!len) {
+		return error(_("trailers file is empty"));
+	} else if (errno != ENOENT) {
+		return error(_("cannot read trailers files"));
+	}
+
+	return 0;
+}
+
 static int read_populate_opts(struct replay_opts *opts)
 {
 	struct replay_ctx *ctx = opts->ctx;
@@ -3233,6 +3253,11 @@ static int read_populate_opts(struct replay_opts *opts)
 			opts->keep_redundant_commits = 1;
 
 		read_strategy_opts(opts, &buf);
+
+		if (read_trailers(opts, &buf)) {
+			ret = -1;
+			goto done_rebase_i;
+		}
 		strbuf_reset(&buf);
 
 		if (read_oneliner(&ctx->current_fixups,
@@ -3328,6 +3353,14 @@ int write_basic_state(struct replay_opts *opts, const char *head_name,
 		write_file(rebase_path_reschedule_failed_exec(), "%s", "");
 	else
 		write_file(rebase_path_no_reschedule_failed_exec(), "%s", "");
+	if (opts->trailer_args.nr) {
+		struct strbuf buf = STRBUF_INIT;
+
+		for (size_t i = 0; i < opts->trailer_args.nr; i++)
+			strbuf_addf(&buf, "%s\n", opts->trailer_args.v[i]);
+		write_file(rebase_path_trailer(), "%s", buf.buf);
+		strbuf_release(&buf);
+	}
 
 	return 0;
 }
@@ -4044,7 +4077,7 @@ static int do_reset(struct repository *r,
 		goto cleanup;
 	}
 
-	tree = parse_tree_indirect(&oid);
+	tree = repo_parse_tree_indirect(the_repository, &oid);
 	if (!tree)
 		return error(_("unable to read tree (%s)"), oid_to_hex(&oid));
 	prime_cache_tree(r, r->index, tree);
@@ -4309,7 +4342,7 @@ static int do_merge(struct repository *r,
 		      git_path_merge_head(r), 0);
 	write_message("no-ff", 5, git_path_merge_mode(r), 0);
 
-	bases = reverse_commit_list(bases);
+	bases = commit_list_reverse(bases);
 
 	repo_read_index(r);
 	init_ui_merge_options(&o, r);
@@ -4373,8 +4406,8 @@ static int do_merge(struct repository *r,
 leave_merge:
 	strbuf_release(&ref_name);
 	rollback_lock_file(&lock);
-	free_commit_list(to_merge);
-	free_commit_list(bases);
+	commit_list_free(to_merge);
+	commit_list_free(bases);
 	return ret;
 }
 
@@ -4624,7 +4657,9 @@ static enum todo_command peek_command(struct todo_list *todo_list, int offset)
 
 static void create_autostash_internal(struct repository *r,
 				      const char *path,
-				      const char *refname)
+				      const char *refname,
+				      const char *message,
+				      bool silent)
 {
 	struct strbuf buf = STRBUF_INIT;
 	struct lock_file lock_file = LOCK_INIT;
@@ -4646,7 +4681,8 @@ static void create_autostash_internal(struct repository *r,
 		struct object_id oid;
 
 		strvec_pushl(&stash.args,
-			     "stash", "create", "autostash", NULL);
+			     "stash", "create",
+			     message ? message : "autostash", NULL);
 		stash.git_cmd = 1;
 		stash.no_stdin = 1;
 		strbuf_reset(&buf);
@@ -4669,7 +4705,8 @@ static void create_autostash_internal(struct repository *r,
 					&oid, null_oid(the_hash_algo), 0, UPDATE_REFS_DIE_ON_ERR);
 		}
 
-		printf(_("Created autostash: %s\n"), buf.buf);
+		if (!silent)
+			printf(_("Created autostash: %s\n"), buf.buf);
 		if (reset_head(r, &ropts) < 0)
 			die(_("could not reset --hard"));
 		discard_index(r->index);
@@ -4681,15 +4718,19 @@ static void create_autostash_internal(struct repository *r,
 
 void create_autostash(struct repository *r, const char *path)
 {
-	create_autostash_internal(r, path, NULL);
+	create_autostash_internal(r, path, NULL, NULL, false);
 }
 
-void create_autostash_ref(struct repository *r, const char *refname)
+void create_autostash_ref(struct repository *r, const char *refname,
+			  const char *message, bool silent)
 {
-	create_autostash_internal(r, NULL, refname);
+	create_autostash_internal(r, NULL, refname, message, silent);
 }
 
-static int apply_save_autostash_oid(const char *stash_oid, int attempt_apply)
+static int apply_save_autostash_oid(const char *stash_oid, int attempt_apply,
+				    const char *label_ours, const char *label_theirs,
+				    const char *label_base,
+				    const char *stash_msg)
 {
 	struct child_process child = CHILD_PROCESS_INIT;
 	int ret = 0;
@@ -4700,6 +4741,12 @@ static int apply_save_autostash_oid(const char *stash_oid, int attempt_apply)
 		child.no_stderr = 1;
 		strvec_push(&child.args, "stash");
 		strvec_push(&child.args, "apply");
+		if (label_ours)
+			strvec_pushf(&child.args, "--label-ours=%s", label_ours);
+		if (label_theirs)
+			strvec_pushf(&child.args, "--label-theirs=%s", label_theirs);
+		if (label_base)
+			strvec_pushf(&child.args, "--label-base=%s", label_base);
 		strvec_push(&child.args, stash_oid);
 		ret = run_command(&child);
 	}
@@ -4713,20 +4760,24 @@ static int apply_save_autostash_oid(const char *stash_oid, int attempt_apply)
 		strvec_push(&store.args, "stash");
 		strvec_push(&store.args, "store");
 		strvec_push(&store.args, "-m");
-		strvec_push(&store.args, "autostash");
+		strvec_push(&store.args, stash_msg ? stash_msg : "autostash");
 		strvec_push(&store.args, "-q");
 		strvec_push(&store.args, stash_oid);
 		if (run_command(&store))
 			ret = error(_("cannot store %s"), stash_oid);
+		else if (attempt_apply)
+			fprintf(stderr,
+				_("Your local changes are stashed, however applying them\n"
+				  "resulted in conflicts.  You can either resolve the conflicts\n"
+				  "and then discard the stash with \"git stash drop\", or, if you\n"
+				  "do not want to resolve them now, run \"git reset --hard\" and\n"
+				  "apply the local changes later by running \"git stash pop\".\n"));
 		else
 			fprintf(stderr,
-				_("%s\n"
+				_("Autostash exists; creating a new stash entry.\n"
 				  "Your changes are safe in the stash.\n"
 				  "You can run \"git stash pop\" or"
-				  " \"git stash drop\" at any time.\n"),
-				attempt_apply ?
-				_("Applying autostash resulted in conflicts.") :
-				_("Autostash exists; creating a new stash entry."));
+				  " \"git stash drop\" at any time.\n"));
 	}
 
 	return ret;
@@ -4744,7 +4795,8 @@ static int apply_save_autostash(const char *path, int attempt_apply)
 	}
 	strbuf_trim(&stash_oid);
 
-	ret = apply_save_autostash_oid(stash_oid.buf, attempt_apply);
+	ret = apply_save_autostash_oid(stash_oid.buf, attempt_apply,
+				      NULL, NULL, NULL, NULL);
 
 	unlink(path);
 	strbuf_release(&stash_oid);
@@ -4763,11 +4815,14 @@ int apply_autostash(const char *path)
 
 int apply_autostash_oid(const char *stash_oid)
 {
-	return apply_save_autostash_oid(stash_oid, 1);
+	return apply_save_autostash_oid(stash_oid, 1, NULL, NULL, NULL, NULL);
 }
 
 static int apply_save_autostash_ref(struct repository *r, const char *refname,
-				    int attempt_apply)
+				    int attempt_apply,
+				    const char *label_ours, const char *label_theirs,
+				    const char *label_base,
+				    const char *stash_msg)
 {
 	struct object_id stash_oid;
 	char stash_oid_hex[GIT_MAX_HEXSZ + 1];
@@ -4783,7 +4838,9 @@ static int apply_save_autostash_ref(struct repository *r, const char *refname,
 		return error(_("autostash reference is a symref"));
 
 	oid_to_hex_r(stash_oid_hex, &stash_oid);
-	ret = apply_save_autostash_oid(stash_oid_hex, attempt_apply);
+	ret = apply_save_autostash_oid(stash_oid_hex, attempt_apply,
+				       label_ours, label_theirs, label_base,
+				       stash_msg);
 
 	refs_delete_ref(get_main_ref_store(r), "", refname,
 			&stash_oid, REF_NO_DEREF);
@@ -4793,12 +4850,17 @@ static int apply_save_autostash_ref(struct repository *r, const char *refname,
 
 int save_autostash_ref(struct repository *r, const char *refname)
 {
-	return apply_save_autostash_ref(r, refname, 0);
+	return apply_save_autostash_ref(r, refname, 0,
+					NULL, NULL, NULL, NULL);
 }
 
-int apply_autostash_ref(struct repository *r, const char *refname)
+int apply_autostash_ref(struct repository *r, const char *refname,
+			const char *label_ours, const char *label_theirs,
+			const char *label_base, const char *stash_msg)
 {
-	return apply_save_autostash_ref(r, refname, 1);
+	return apply_save_autostash_ref(r, refname, 1,
+					label_ours, label_theirs, label_base,
+					stash_msg);
 }
 
 static int checkout_onto(struct repository *r, struct replay_opts *opts,
@@ -5572,6 +5634,43 @@ out:
 	return res;
 }
 
+void sequencer_format_revert_message(struct repository *r,
+				     const char *subject,
+				     const struct commit *commit,
+				     const struct commit *parent,
+				     bool use_commit_reference,
+				     struct strbuf *message)
+{
+	const char *orig_subject;
+
+	if (use_commit_reference) {
+		strbuf_commented_addf(message, comment_line_str,
+				      "*** SAY WHY WE ARE REVERTING ON THE TITLE LINE ***");
+	} else if (skip_prefix(subject, "Revert \"", &orig_subject) &&
+		   /*
+		    * We don't touch pre-existing repeated reverts, because
+		    * theoretically these can be nested arbitrarily deeply,
+		    * thus requiring excessive complexity to deal with.
+		    */
+		   !starts_with(orig_subject, "Revert \"")) {
+		strbuf_addstr(message, "Reapply \"");
+		strbuf_addstr(message, orig_subject);
+		strbuf_addstr(message, "\n");
+	} else {
+		strbuf_addstr(message, "Revert \"");
+		strbuf_addstr(message, subject);
+		strbuf_addstr(message, "\"\n");
+	}
+	strbuf_addstr(message, "\nThis reverts commit ");
+	refer_to_commit(r, message, commit, use_commit_reference);
+
+	if (commit->parents && commit->parents->next) {
+		strbuf_addstr(message, ", reversing\nchanges made to ");
+		refer_to_commit(r, message, parent, use_commit_reference);
+	}
+	strbuf_addstr(message, ".\n");
+}
+
 void append_signoff(struct strbuf *msgbuf, size_t ignore_footer, unsigned flag)
 {
 	unsigned no_dup_sob = flag & APPEND_SIGNOFF_DEDUP;
@@ -6031,11 +6130,11 @@ static int make_script_with_merges(struct pretty_print_context *pp,
 			oidset_insert(&shown, oid);
 		}
 
-		free_commit_list(list);
+		commit_list_free(list);
 	}
 
-	free_commit_list(commits);
-	free_commit_list(tips);
+	commit_list_free(commits);
+	commit_list_free(tips);
 
 	strbuf_release(&label_from_message);
 	strbuf_release(&oneline);
@@ -6339,7 +6438,6 @@ struct todo_add_branch_context {
 	size_t items_nr;
 	size_t items_alloc;
 	struct strbuf *buf;
-	struct commit *commit;
 	struct string_list refs_to_oids;
 };
 
@@ -6361,8 +6459,14 @@ static int add_decorations_to_list(const struct commit *commit,
 		/*
 		 * If the branch is the current HEAD, then it will be
 		 * updated by the default rebase behavior.
+		 * Exclude it from the list of refs to update,
+		 * as well as any non-branch decorations.
+		 * Non-branch decorations may be present if the pretty format
+		 * includes "%d", which would have loaded all refs
+		 * into the global decoration table.
 		 */
-		if (head_ref && !strcmp(head_ref, decoration->name)) {
+		if ((head_ref && !strcmp(head_ref, decoration->name)) ||
+		    (decoration->type != DECORATION_REF_LOCAL)) {
 			decoration = decoration->next;
 			continue;
 		}
@@ -6428,7 +6532,6 @@ static int todo_list_add_update_ref_commands(struct todo_list *todo_list)
 		ctx.items[ctx.items_nr++] = todo_list->items[i++];
 
 		if (item->commit) {
-			ctx.commit = item->commit;
 			add_decorations_to_list(item->commit, &ctx);
 		}
 	}

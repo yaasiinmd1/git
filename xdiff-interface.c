@@ -1,4 +1,3 @@
-#define USE_THE_REPOSITORY_VARIABLE
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
@@ -177,18 +176,19 @@ int read_mmfile(mmfile_t *ptr, const char *filename)
 	return 0;
 }
 
-void read_mmblob(mmfile_t *ptr, const struct object_id *oid)
+void read_mmblob(mmfile_t *ptr, struct object_database *odb,
+		 const struct object_id *oid)
 {
-	unsigned long size;
+	size_t size;
 	enum object_type type;
 
-	if (oideq(oid, null_oid(the_hash_algo))) {
+	if (is_null_oid(oid)) {
 		ptr->ptr = xstrdup("");
 		ptr->size = 0;
 		return;
 	}
 
-	ptr->ptr = odb_read_object(the_repository->objects, oid, &type, &size);
+	ptr->ptr = odb_read_object(odb, oid, &type, &size);
 	if (!ptr->ptr || type != OBJ_BLOB)
 		die("unable to read blob object %s", oid_to_hex(oid));
 	ptr->size = size;
@@ -300,7 +300,7 @@ void xdiff_clear_find_func(xdemitconf_t *xecfg)
 
 unsigned long xdiff_hash_string(const char *s, size_t len, long flags)
 {
-	return xdl_hash_record(&s, s + len, flags);
+	return xdl_hash_record((uint8_t const**)&s, (uint8_t const*)s + len, flags);
 }
 
 int xdiff_compare_lines(const char *l1, long s1,
@@ -323,6 +323,18 @@ int parse_conflict_style_name(const char *value)
 	 */
 	else
 		return -1;
+}
+
+const char *conflict_style_name(int style)
+{
+	switch (style) {
+	case XDL_MERGE_DIFF3:
+		return "diff3";
+	case XDL_MERGE_ZEALOUS_DIFF3:
+		return "zdiff3";
+	default:
+		return "merge";
+	}
 }
 
 int git_xmerge_style = -1;

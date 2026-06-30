@@ -1196,6 +1196,20 @@ test_expect_success 'stdin -z create ref fails with empty new value' '
 	test_must_fail git rev-parse --verify -q $c
 '
 
+test_expect_success 'stdin -z create ref fails with non commit object' '
+	printf $F "create $c" "$(test_oid 001)" >stdin &&
+	test_must_fail git update-ref -z --stdin <stdin 2>err &&
+	grep "fatal: trying to write ref ${SQ}$c${SQ} with nonexistent object" err &&
+	test_must_fail git rev-parse --verify -q $c
+'
+
+test_expect_success 'stdin -z update ref fails with non commit object' '
+	printf $F "update $b" "$(test_oid 001)" "" >stdin &&
+	test_must_fail git update-ref -z --stdin <stdin 2>err &&
+	grep "fatal: trying to write ref ${SQ}$b${SQ} with nonexistent object" err &&
+	test_must_fail git rev-parse --verify -q $c
+'
+
 test_expect_success 'stdin -z update ref works with right old value' '
 	printf $F "update $b" "$m~1" "$m" >stdin &&
 	git update-ref -z --stdin <stdin &&
@@ -1380,16 +1394,16 @@ test_expect_success 'fails with duplicate ref update via symref' '
 
 test_expect_success ULIMIT_FILE_DESCRIPTORS 'large transaction creating branches does not burst open file limit' '
 (
-	test_seq -f "create refs/heads/%d HEAD" 33 >large_input &&
-	run_with_limited_open_files git update-ref --stdin <large_input &&
+	test_seq -f "create refs/heads/%d HEAD" 33 |
+	run_with_limited_open_files git update-ref --stdin &&
 	git rev-parse --verify -q refs/heads/33
 )
 '
 
 test_expect_success ULIMIT_FILE_DESCRIPTORS 'large transaction deleting branches does not burst open file limit' '
 (
-	test_seq -f "delete refs/heads/%d HEAD" 33 >large_input &&
-	run_with_limited_open_files git update-ref --stdin <large_input &&
+	test_seq -f "delete refs/heads/%d HEAD" 33 |
+	run_with_limited_open_files git update-ref --stdin &&
 	test_must_fail git rev-parse --verify -q refs/heads/33
 )
 '
@@ -1610,6 +1624,7 @@ test_expect_success 'transaction cannot restart ongoing transaction' '
 '
 
 test_expect_success PIPE 'transaction flushes status updates' '
+	test_when_finished "rm -f in out" &&
 	mkfifo in out &&
 	(git update-ref --stdin <in >out &) &&
 
@@ -2093,14 +2108,15 @@ do
 
 			format_command $type "update refs/heads/ref1" "$old_head" "$head" >stdin &&
 			format_command $type "update refs/heads/ref2" "$(test_oid 001)" "$head" >>stdin &&
-			git update-ref $type --stdin --batch-updates <stdin >stdout &&
+			git update-ref $type --stdin --batch-updates <stdin >stdout 2>err &&
 			echo $old_head >expect &&
 			git rev-parse refs/heads/ref1 >actual &&
 			test_cmp expect actual &&
 			echo $head >expect &&
 			git rev-parse refs/heads/ref2 >actual &&
 			test_cmp expect actual &&
-			test_grep -q "invalid new value provided" stdout
+			test_grep "rejected refs/heads/ref2 $(test_oid 001) $head invalid new value provided" stdout &&
+			test_grep "trying to write ref ${SQ}refs/heads/ref2${SQ} with nonexistent object" err
 		)
 	'
 
@@ -2119,14 +2135,15 @@ do
 
 			format_command $type "update refs/heads/ref1" "$old_head" "$head" >stdin &&
 			format_command $type "update refs/heads/ref2" "$head_tree" "$head" >>stdin &&
-			git update-ref $type --stdin --batch-updates <stdin >stdout &&
+			git update-ref $type --stdin --batch-updates <stdin >stdout 2>err &&
 			echo $old_head >expect &&
 			git rev-parse refs/heads/ref1 >actual &&
 			test_cmp expect actual &&
 			echo $head >expect &&
 			git rev-parse refs/heads/ref2 >actual &&
 			test_cmp expect actual &&
-			test_grep -q "invalid new value provided" stdout
+			test_grep "rejected refs/heads/ref2 $head_tree $head invalid new value provided" stdout &&
+			test_grep "trying to write non-commit object $head_tree to branch ${SQ}refs/heads/ref2${SQ}" err
 		)
 	'
 
@@ -2143,12 +2160,13 @@ do
 
 			format_command $type "update refs/heads/ref1" "$old_head" "$head" >stdin &&
 			format_command $type "update refs/heads/ref2" "$old_head" "$head" >>stdin &&
-			git update-ref $type --stdin --batch-updates <stdin >stdout &&
+			git update-ref $type --stdin --batch-updates <stdin >stdout 2>err &&
 			echo $old_head >expect &&
 			git rev-parse refs/heads/ref1 >actual &&
 			test_cmp expect actual &&
 			test_must_fail git rev-parse refs/heads/ref2 &&
-			test_grep -q "reference does not exist" stdout
+			test_grep "rejected refs/heads/ref2 $old_head $head reference does not exist" stdout &&
+			test_grep "cannot lock ref ${SQ}refs/heads/ref2${SQ}: unable to resolve reference ${SQ}refs/heads/ref2${SQ}" err
 		)
 	'
 
@@ -2166,13 +2184,14 @@ do
 
 			format_command $type "update refs/heads/ref1" "$old_head" "$head" >stdin &&
 			format_command $type "update refs/heads/ref2" "$old_head" "$head" >>stdin &&
-			git update-ref $type --no-deref --stdin --batch-updates <stdin >stdout &&
+			git update-ref $type --no-deref --stdin --batch-updates <stdin >stdout 2>err &&
 			echo $old_head >expect &&
 			git rev-parse refs/heads/ref1 >actual &&
 			test_cmp expect actual &&
 			echo $head >expect &&
 			test_must_fail git rev-parse refs/heads/ref2 &&
-			test_grep -q "reference does not exist" stdout
+			test_grep "rejected refs/heads/ref2 $old_head $head reference does not exist" stdout &&
+			test_grep "cannot lock ref ${SQ}refs/heads/ref2${SQ}: reference is missing but expected $head" err
 		)
 	'
 
@@ -2190,7 +2209,7 @@ do
 
 			format_command $type "update refs/heads/ref1" "$old_head" "$head" >stdin &&
 			format_command $type "symref-update refs/heads/ref2" "$old_head" "ref" "refs/heads/nonexistent" >>stdin &&
-			git update-ref $type --no-deref --stdin --batch-updates <stdin >stdout &&
+			git update-ref $type --no-deref --stdin --batch-updates <stdin >stdout 2>err &&
 			echo $old_head >expect &&
 			git rev-parse refs/heads/ref1 >actual &&
 			test_cmp expect actual &&
@@ -2198,7 +2217,8 @@ do
 			echo $head >expect &&
 			git rev-parse refs/heads/ref2 >actual &&
 			test_cmp expect actual &&
-			test_grep -q "expected symref but found regular ref" stdout
+			test_grep "rejected refs/heads/ref2 $ZERO_OID $ZERO_OID expected symref but found regular ref" stdout &&
+			test_grep "cannot lock ref ${SQ}refs/heads/ref2${SQ}: expected symref with target ${SQ}refs/heads/nonexistent${SQ}: but is a regular ref" err
 		)
 	'
 
@@ -2216,14 +2236,15 @@ do
 
 			format_command $type "update refs/heads/ref1" "$old_head" "$head" >stdin &&
 			format_command $type "update refs/heads/ref2" "$old_head" "$Z" >>stdin &&
-			git update-ref $type --stdin --batch-updates <stdin >stdout &&
+			git update-ref $type --stdin --batch-updates <stdin >stdout 2>err &&
 			echo $old_head >expect &&
 			git rev-parse refs/heads/ref1 >actual &&
 			test_cmp expect actual &&
 			echo $head >expect &&
 			git rev-parse refs/heads/ref2 >actual &&
 			test_cmp expect actual &&
-			test_grep -q "reference already exists" stdout
+			test_grep "rejected refs/heads/ref2 $old_head $ZERO_OID reference already exists" stdout &&
+			test_grep "cannot lock ref ${SQ}refs/heads/ref2${SQ}: reference already exists" err
 		)
 	'
 
@@ -2241,14 +2262,15 @@ do
 
 			format_command $type "update refs/heads/ref1" "$old_head" "$head" >stdin &&
 			format_command $type "update refs/heads/ref2" "$head" "$old_head" >>stdin &&
-			git update-ref $type --stdin --batch-updates <stdin >stdout &&
+			git update-ref $type --stdin --batch-updates <stdin >stdout 2>err &&
 			echo $old_head >expect &&
 			git rev-parse refs/heads/ref1 >actual &&
 			test_cmp expect actual &&
 			echo $head >expect &&
 			git rev-parse refs/heads/ref2 >actual &&
 			test_cmp expect actual &&
-			test_grep -q "incorrect old value provided" stdout
+			test_grep "rejected refs/heads/ref2 $head $old_head incorrect old value provided" stdout &&
+			test_grep "cannot lock ref ${SQ}refs/heads/ref2${SQ}: is at $head but expected $old_head" err
 		)
 	'
 
@@ -2264,12 +2286,13 @@ do
 			git update-ref refs/heads/ref/foo $head &&
 
 			format_command $type "update refs/heads/ref/foo" "$old_head" "$head" >stdin &&
-			format_command $type "update refs/heads/ref" "$old_head" "" >>stdin &&
-			git update-ref $type --stdin --batch-updates <stdin >stdout &&
+			format_command $type "update refs/heads/ref" "$old_head" "$ZERO_OID" >>stdin &&
+			git update-ref $type --stdin --batch-updates <stdin >stdout 2>err &&
 			echo $old_head >expect &&
 			git rev-parse refs/heads/ref/foo >actual &&
 			test_cmp expect actual &&
-			test_grep -q "refname conflict" stdout
+			test_grep "rejected refs/heads/ref $old_head $ZERO_OID refname conflict" stdout &&
+			test_grep "${SQ}refs/heads/ref/foo${SQ} exists; cannot create ${SQ}refs/heads/ref${SQ}" err
 		)
 	'
 
@@ -2284,13 +2307,14 @@ do
 			head=$(git rev-parse HEAD) &&
 			git update-ref refs/heads/ref/foo $head &&
 
-			format_command $type "update refs/heads/foo" "$old_head" "" >stdin &&
-			format_command $type "update refs/heads/ref" "$old_head" "" >>stdin &&
-			git update-ref $type --stdin --batch-updates <stdin >stdout &&
+			format_command $type "update refs/heads/foo" "$old_head" "$ZERO_OID" >stdin &&
+			format_command $type "update refs/heads/ref" "$old_head" "$ZERO_OID" >>stdin &&
+			git update-ref $type --stdin --batch-updates <stdin >stdout 2>err &&
 			echo $old_head >expect &&
 			git rev-parse refs/heads/foo >actual &&
 			test_cmp expect actual &&
-			test_grep -q "refname conflict" stdout
+			test_grep "rejected refs/heads/ref $old_head $ZERO_OID refname conflict" stdout &&
+			test_grep "${SQ}refs/heads/ref/foo${SQ} exists; cannot create ${SQ}refs/heads/ref${SQ}" err
 		)
 	'
 
@@ -2309,14 +2333,15 @@ do
 				format_command $type "create refs/heads/ref" "$old_head" &&
 				format_command $type "create refs/heads/Foo" "$old_head"
 			} >stdin &&
-			git update-ref $type --stdin --batch-updates <stdin >stdout &&
+			git update-ref $type --stdin --batch-updates <stdin >stdout 2>err &&
 
 			echo $head >expect &&
 			git rev-parse refs/heads/foo >actual &&
 			echo $old_head >expect &&
 			git rev-parse refs/heads/ref >actual &&
 			test_cmp expect actual &&
-			test_grep -q "reference conflict due to case-insensitive filesystem" stdout
+			test_grep "rejected refs/heads/Foo $old_head $ZERO_OID reference conflict due to case-insensitive filesystem" stdout &&
+			test_grep -e "cannot lock ref ${SQ}refs/heads/Foo${SQ}: Unable to create" -e "Foo.lock" err
 		)
 	'
 
@@ -2357,8 +2382,9 @@ do
 			git symbolic-ref refs/heads/symbolic refs/heads/non-existent &&
 
 			format_command $type "delete refs/heads/symbolic" "$head" >stdin &&
-			git update-ref $type --stdin --batch-updates <stdin >stdout &&
-			test_grep "reference does not exist" stdout
+			git update-ref $type --stdin --batch-updates <stdin >stdout 2>err &&
+			test_grep "rejected refs/heads/non-existent $ZERO_OID $head reference does not exist" stdout &&
+			test_grep "cannot lock ref ${SQ}refs/heads/symbolic${SQ}: unable to resolve reference ${SQ}refs/heads/non-existent${SQ}" err
 		)
 	'
 
@@ -2373,8 +2399,9 @@ do
 			head=$(git rev-parse HEAD) &&
 
 			format_command $type "delete refs/heads/new-branch" "$head" >stdin &&
-			git update-ref $type --stdin --batch-updates <stdin >stdout &&
-			test_grep "incorrect old value provided" stdout
+			git update-ref $type --stdin --batch-updates <stdin >stdout 2>err &&
+			test_grep "rejected refs/heads/new-branch $ZERO_OID $head incorrect old value provided" stdout &&
+			test_grep "cannot lock ref ${SQ}refs/heads/new-branch${SQ}: is at $(git rev-parse new-branch) but expected $head" err
 		)
 	'
 
@@ -2387,8 +2414,9 @@ do
 			head=$(git rev-parse HEAD) &&
 
 			format_command $type "delete refs/heads/non-existent" "$head" >stdin &&
-			git update-ref $type --stdin --batch-updates <stdin >stdout &&
-			test_grep "reference does not exist" stdout
+			git update-ref $type --stdin --batch-updates <stdin >stdout 2>err &&
+			test_grep "rejected refs/heads/non-existent $ZERO_OID $head reference does not exist" stdout &&
+			test_grep "cannot lock ref ${SQ}refs/heads/non-existent${SQ}: unable to resolve reference ${SQ}refs/heads/non-existent${SQ}" err
 		)
 	'
 done

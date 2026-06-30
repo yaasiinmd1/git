@@ -11,6 +11,13 @@ export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
 . ./test-lib.sh
 . "$TEST_DIRECTORY"/lib-terminal.sh
 
+# test-lib.sh may have added global config (e.g. safe.bareRepository)
+# that would appear in "git config --list" output and break tests
+# that expect exact config contents.
+test_expect_success 'remove global config from test-lib.sh' '
+	test_might_fail git config --global --unset-all safe.bareRepository
+'
+
 for mode in legacy subcommands
 do
 
@@ -460,6 +467,62 @@ EOF
 
 test_expect_success 'invalid key' '
 	test_must_fail git config inval.2key blabla
+'
+
+test_expect_success 'set with 1 arg of "key=value": valid key suggests split form' '
+	test_must_fail git config set pull.rebase=false 2>err &&
+	test_grep "missing value to set to the variable .pull\\.rebase=false." err &&
+	test_grep "did you mean .git config set pull\\.rebase false." err
+'
+
+test_expect_success 'set with 1 arg of "key=value": implicit form suggests split form' '
+	test_must_fail git config pull.rebase=false 2>err &&
+	test_grep "missing value to set to the variable .pull\\.rebase=false." err &&
+	test_grep "did you mean .git config set pull\\.rebase false." err
+'
+
+test_expect_success 'set with 1 arg of "key=value": invalid key does not suggest split form' '
+	test_must_fail git config set foo=bar 2>err &&
+	test_grep "missing value to set to a variable with an invalid name .foo=bar." err &&
+	test_grep ! "did you mean" err
+'
+
+test_expect_success 'set with 1 arg: variable name starting with digit is invalid' '
+	test_must_fail git config set foo.1bar=baz 2>err &&
+	test_grep "missing value to set to a variable with an invalid name .foo\\.1bar=baz." err &&
+	test_grep ! "did you mean" err
+'
+
+test_expect_success 'set with 1 arg: digit-led section name is valid' '
+	test_must_fail git config set 1foo.bar=baz 2>err &&
+	test_grep "missing value to set to the variable .1foo\\.bar=baz." err &&
+	test_grep "did you mean .git config set 1foo\\.bar baz." err
+'
+
+test_expect_success 'set with 1 arg: subsection plus invalid variable name' '
+	test_must_fail git config set foo.some.b_r=baz 2>err &&
+	test_grep "missing value to set to a variable with an invalid name .foo\\.some\\.b_r=baz." err &&
+	test_grep ! "did you mean" err
+'
+
+test_expect_success 'set with 1 arg of valid key reports missing value' '
+	test_must_fail git config set pull.rebase 2>err &&
+	test_grep "missing value to set to the variable .pull\\.rebase." err &&
+	test_grep ! "did you mean" err
+'
+
+test_expect_success 'set with 2 args including "=" in invalid key does not suggest' '
+	test_must_fail git config set pull.rebase=false true 2>err &&
+	test_grep "invalid key: pull\\.rebase=false" err &&
+	test_grep ! "did you mean" err
+'
+
+test_expect_success '"=" inside subsection is valid' '
+	test_when_finished "rm -f subsection.cfg" &&
+	git config set -f subsection.cfg foo.bar=baz.boo qux &&
+	echo qux >expect &&
+	git config get -f subsection.cfg foo.bar=baz.boo >actual &&
+	test_cmp expect actual
 '
 
 test_expect_success 'correct key' '
@@ -1232,12 +1295,12 @@ test_expect_success SYMLINKS 'symlinked configuration' '
 	test_when_finished "rm myconfig" &&
 	ln -s notyet myconfig &&
 	git config --file=myconfig test.frotz nitfol &&
-	test -h myconfig &&
-	test -f notyet &&
+	test_path_is_symlink myconfig &&
+	test_path_is_file notyet &&
 	test "z$(git config --file=notyet test.frotz)" = znitfol &&
 	git config --file=myconfig test.xyzzy rezrov &&
-	test -h myconfig &&
-	test -f notyet &&
+	test_path_is_symlink myconfig &&
+	test_path_is_file notyet &&
 	cat >expect <<-\EOF &&
 	nitfol
 	rezrov
@@ -2459,9 +2522,15 @@ done
 
 cat >.git/config <<-\EOF &&
 [section]
-foo = true
+foo = True
 number = 10
 big = 1M
+path = ~/dir
+red = red
+blue = Blue
+date = Fri Jun 4 15:46:55 2010
+missing=:(optional)no-such-path
+exists=:(optional)expect
 EOF
 
 test_expect_success 'identical modern --type specifiers are allowed' '
@@ -2501,6 +2570,82 @@ test_expect_success '--no-type unsets type specifiers' '
 
 test_expect_success 'unset type specifiers may be reset to conflicting ones' '
 	test_cmp_config 1048576 --type=bool --no-type --type=int section.big
+'
+
+test_expect_success 'list --type=int shows only canonicalizable int values' '
+	cat >expect <<-EOF &&
+	section.number=10
+	section.big=1048576
+	EOF
+
+	git config ${mode_prefix}list --type=int >actual 2>err &&
+	test_cmp expect actual &&
+	test_must_be_empty err
+'
+
+test_expect_success 'list --type=bool shows only canonicalizable bool values' '
+	cat >expect <<-EOF &&
+	section.foo=true
+	section.number=true
+	section.big=true
+	EOF
+
+	git config ${mode_prefix}list --type=bool >actual 2>err &&
+	test_cmp expect actual &&
+	test_must_be_empty err
+'
+
+test_expect_success 'list --type=bool-or-int shows only canonicalizable values' '
+	cat >expect <<-EOF &&
+	section.foo=true
+	section.number=10
+	section.big=1048576
+	EOF
+
+	git config ${mode_prefix}list --type=bool-or-int >actual 2>err &&
+	test_cmp expect actual &&
+	test_must_be_empty err
+'
+
+test_expect_success 'list --type=path shows only canonicalizable path values' '
+	cat >expect <<-EOF &&
+	section.foo=True
+	section.number=10
+	section.big=1M
+	section.path=$HOME/dir
+	section.red=red
+	section.blue=Blue
+	section.date=Fri Jun 4 15:46:55 2010
+	section.exists=expect
+	EOF
+
+	git config ${mode_prefix}list --type=path >actual 2>err &&
+	test_cmp expect actual &&
+	test_must_be_empty err
+'
+
+test_expect_success 'list --type=expiry-date shows only canonicalizable dates' '
+	git config ${mode_prefix}list --type=expiry-date >actual 2>err &&
+
+	# section.number and section.big parse as relative dates that could
+	# have clock skew in their results.
+	test_grep section.big actual &&
+	test_grep section.number actual &&
+	test_grep "section.date=$(git config --type=expiry-date section.$key)" actual &&
+	test_must_be_empty err
+'
+
+test_expect_success 'list --type=color shows only canonicalizable color values' '
+	cat >expect <<-EOF &&
+	section.number=<>
+	section.red=<RED>
+	section.blue=<BLUE>
+	EOF
+
+	git config ${mode_prefix}list --type=color >actual.raw 2>err &&
+	test_decode_color <actual.raw >actual &&
+	test_cmp expect actual &&
+	test_must_be_empty err
 '
 
 test_expect_success '--type rejects unknown specifiers' '

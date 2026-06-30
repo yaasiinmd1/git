@@ -103,15 +103,25 @@ static inline int repo_parse_commit(struct repository *r, struct commit *item)
 	return repo_parse_commit_gently(r, item, 0);
 }
 
+void unparse_commit(struct repository *r, const struct object_id *oid);
+
 static inline int repo_parse_commit_no_graph(struct repository *r,
 					     struct commit *commit)
 {
+	/*
+	 * When the commit has been parsed but its tree wasn't populated then
+	 * this is an indicator that it has been parsed via the commit-graph.
+	 * We cannot read the tree via the commit-graph, as we're explicitly
+	 * told not to use it. We thus have to first un-parse the object so
+	 * that we can re-parse it without the graph.
+	 */
+	if (commit->object.parsed && !commit->maybe_tree)
+		unparse_commit(r, &commit->object.oid);
+
 	return repo_parse_commit_internal(r, commit, 0, 0);
 }
 
 void parse_commit_or_die(struct commit *item);
-
-void unparse_commit(struct repository *r, const struct object_id *oid);
 
 struct buffer_slab;
 struct buffer_slab *allocate_commit_buffer_slab(void);
@@ -181,17 +191,15 @@ int commit_list_contains(struct commit *item,
 struct commit_list **commit_list_append(struct commit *commit,
 					struct commit_list **next);
 unsigned commit_list_count(const struct commit_list *l);
-struct commit_list *commit_list_insert_by_date(struct commit *item,
-				    struct commit_list **list);
 void commit_list_sort_by_date(struct commit_list **list);
 
 /* Shallow copy of the input list */
-struct commit_list *copy_commit_list(const struct commit_list *list);
+struct commit_list *commit_list_copy(const struct commit_list *list);
 
 /* Modify list in-place to reverse it, returning new head; list will be tail */
-struct commit_list *reverse_commit_list(struct commit_list *list);
+struct commit_list *commit_list_reverse(struct commit_list *list);
 
-void free_commit_list(struct commit_list *list);
+void commit_list_free(struct commit_list *list);
 
 struct rev_info; /* in revision.h, it circularly uses enum cmit_fmt */
 
@@ -258,7 +266,7 @@ int for_each_commit_graft(each_commit_graft_fn, void *);
 int interactive_add(struct repository *repo,
 		    const char **argv,
 		    const char *prefix,
-		    int patch, struct add_p_opt *add_p_opt);
+		    int patch, struct interactive_options *opts);
 
 struct commit_extra_header {
 	struct commit_extra_header *next;
@@ -333,6 +341,13 @@ int remove_signature(struct strbuf *buf);
  */
 int check_commit_signature(const struct commit *commit, struct signature_check *sigc);
 
+/*
+ * Same as check_commit_signature() but accepts a commit buffer and
+ * its size, instead of a `struct commit *`.
+ */
+int verify_commit_buffer(const char *buffer, size_t size,
+			 struct signature_check *sigc);
+
 /* record author-date for each commit object */
 struct author_date_slab;
 void record_author_date(struct author_date_slab *author_date,
@@ -364,8 +379,6 @@ LAST_ARG_MUST_BE_NULL
 int run_commit_hook(int editor_is_used, const char *index_file,
 		    int *invoked_hook, const char *name, ...);
 
-/* Sign a commit or tag buffer, storing the result in a header. */
-int sign_with_header(struct strbuf *buf, const char *keyid);
 /* Parse the signature out of a header. */
 int parse_buffer_signed_by_header(const char *buffer,
 				  unsigned long size,
@@ -373,5 +386,17 @@ int parse_buffer_signed_by_header(const char *buffer,
 				  struct strbuf *signature,
 				  const struct git_hash_algo *algop);
 int add_header_signature(struct strbuf *buf, struct strbuf *sig, const struct git_hash_algo *algo);
+
+struct commit_stack {
+	struct commit **items;
+	size_t nr, alloc;
+};
+#define COMMIT_STACK_INIT { 0 }
+
+void commit_stack_init(struct commit_stack *);
+void commit_stack_grow(struct commit_stack *, size_t);
+void commit_stack_push(struct commit_stack *, struct commit *);
+struct commit *commit_stack_pop(struct commit_stack *);
+void commit_stack_clear(struct commit_stack *);
 
 #endif /* COMMIT_H */

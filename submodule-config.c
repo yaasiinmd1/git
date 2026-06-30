@@ -14,6 +14,7 @@
 #include "strbuf.h"
 #include "object-name.h"
 #include "odb.h"
+#include "odb/source.h"
 #include "parse-options.h"
 #include "thread-utils.h"
 #include "tree-walk.h"
@@ -693,7 +694,7 @@ static const struct submodule *config_from(struct submodule_cache *cache,
 		enum lookup_type lookup_type)
 {
 	struct strbuf rev = STRBUF_INIT;
-	unsigned long config_size;
+	size_t config_size;
 	char *config = NULL;
 	struct object_id oid;
 	enum object_type type;
@@ -1037,5 +1038,5 @@ static int gitmodules_update_clone_config(const char *var, const char *value,
 
 void update_clone_config_from_gitmodules(int *max_jobs)
 {
-	config_from_gitmodules(gitmodules_update_clone_config, the_repository, &max_jobs);
+	config_from_gitmodules(gitmodules_update_clone_config, the_repository, max_jobs);
 }

@@ -18,13 +18,13 @@
 #include "list-objects-filter-options.h"
 #include "parse-options.h"
 #include "userdiff.h"
-#include "streaming.h"
 #include "oid-array.h"
 #include "packfile.h"
 #include "pack-bitmap.h"
 #include "object-file.h"
 #include "object-name.h"
 #include "odb.h"
+#include "odb/streaming.h"
 #include "replace-object.h"
 #include "promisor-remote.h"
 #include "mailmap.h"
@@ -57,6 +57,20 @@ static int use_mailmap;
 
 static char *replace_idents_using_mailmap(char *, size_t *);
 
+/*
+ * The mailmap is initialized with .strdup_strings set to 0,
+ * but read_mailmap() sets the bit to 1 (this is true even when
+ * not a single mailmap entry is read), so it can be used for
+ * lazy loading.
+ */
+static void load_mailmap(void)
+{
+	if (mailmap.strdup_strings)
+		return;
+
+	read_mailmap(the_repository, &mailmap);
+}
+
 static char *replace_idents_using_mailmap(char *object_buf, size_t *size)
 {
 	struct strbuf sb = STRBUF_INIT;
@@ -70,7 +84,7 @@ static char *replace_idents_using_mailmap(char *object_buf, size_t *size)
 
 static int filter_object(const char *path, unsigned mode,
 			 const struct object_id *oid,
-			 char **buf, unsigned long *size)
+			 char **buf, size_t *size)
 {
 	enum object_type type;
 
@@ -95,7 +109,7 @@ static int filter_object(const char *path, unsigned mode,
 
 static int stream_blob(const struct object_id *oid)
 {
-	if (stream_blob_to_fd(1, oid, NULL, 0))
+	if (odb_stream_blob_to_fd(the_repository->objects, 1, oid, NULL, 0))
 		die("unable to stream %s to stdout", oid_to_hex(oid));
 	return 0;
 }
@@ -106,7 +120,7 @@ static int cat_one_file(int opt, const char *exp_type, const char *obj_name)
 	struct object_id oid;
 	enum object_type type;
 	char *buf;
-	unsigned long size;
+	size_t size;
 	struct object_context obj_context = {0};
 	struct object_info oi = OBJECT_INFO_INIT;
 	unsigned flags = OBJECT_INFO_LOOKUP_REPLACE;
@@ -149,11 +163,8 @@ static int cat_one_file(int opt, const char *exp_type, const char *obj_name)
 		if (odb_read_object_info_extended(the_repository->objects, &oid, &oi, flags) < 0)
 			die("git cat-file: could not get object info");
 
-		if (use_mailmap && (type == OBJ_COMMIT || type == OBJ_TAG)) {
-			size_t s = size;
-			buf = replace_idents_using_mailmap(buf, &s);
-			size = cast_size_t_to_ulong(s);
-		}
+		if (use_mailmap && (type == OBJ_COMMIT || type == OBJ_TAG))
+			buf = replace_idents_using_mailmap(buf, &size);
 
 		printf("%"PRIuMAX"\n", (uintmax_t)size);
 		ret = 0;
@@ -161,7 +172,7 @@ static int cat_one_file(int opt, const char *exp_type, const char *obj_name)
 
 	case 'e':
 		ret = !odb_has_object(the_repository->objects, &oid,
-				      HAS_OBJECT_RECHECK_PACKED | HAS_OBJECT_FETCH_PROMISOR);
+				      ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR);
 		goto cleanup;
 
 	case 'w':
@@ -174,9 +185,15 @@ static int cat_one_file(int opt, const char *exp_type, const char *obj_name)
 		break;
 
 	case 'c':
-		if (textconv_object(the_repository, path, obj_context.mode,
-				    &oid, 1, &buf, &size))
+	{
+		unsigned long size_ul = 0;
+		int textconv_ret = textconv_object(the_repository, path,
+						   obj_context.mode, &oid, 1,
+						   &buf, &size_ul);
+		size = size_ul;
+		if (textconv_ret)
 			break;
+	}
 		/* else fallthrough */
 
 	case 'p':
@@ -202,11 +219,8 @@ static int cat_one_file(int opt, const char *exp_type, const char *obj_name)
 		if (!buf)
 			die("Cannot read object %s", obj_name);
 
-		if (use_mailmap) {
-			size_t s = size;
-			buf = replace_idents_using_mailmap(buf, &s);
-			size = cast_size_t_to_ulong(s);
-		}
+		if (use_mailmap)
+			buf = replace_idents_using_mailmap(buf, &size);
 
 		/* otherwise just spit out the data */
 		break;
@@ -249,11 +263,8 @@ static int cat_one_file(int opt, const char *exp_type, const char *obj_name)
 		buf = odb_read_object_peeled(the_repository->objects, &oid,
 					     exp_type_id, &size, NULL);
 
-		if (use_mailmap) {
-			size_t s = size;
-			buf = replace_idents_using_mailmap(buf, &s);
-			size = cast_size_t_to_ulong(s);
-		}
+		if (use_mailmap)
+			buf = replace_idents_using_mailmap(buf, &size);
 		break;
 	}
 	default:
@@ -274,7 +285,7 @@ cleanup:
 struct expand_data {
 	struct object_id oid;
 	enum object_type type;
-	unsigned long size;
+	size_t size;
 	unsigned short mode;
 	off_t disk_size;
 	const char *rest;
@@ -320,7 +331,7 @@ static int expand_atom(struct strbuf *sb, const char *atom, int len,
 {
 	if (is_atom("objectname", atom, len)) {
 		if (!data->mark_query)
-			strbuf_addstr(sb, oid_to_hex(&data->oid));
+			strbuf_add_oid_hex(sb, &data->oid);
 	} else if (is_atom("objecttype", atom, len)) {
 		if (data->mark_query)
 			data->info.typep = &data->type;
@@ -330,12 +341,12 @@ static int expand_atom(struct strbuf *sb, const char *atom, int len,
 		if (data->mark_query)
 			data->info.sizep = &data->size;
 		else
-			strbuf_addf(sb, "%"PRIuMAX , (uintmax_t)data->size);
+			strbuf_add_uint(sb, data->size);
 	} else if (is_atom("objectsize:disk", atom, len)) {
 		if (data->mark_query)
 			data->info.disk_sizep = &data->disk_size;
 		else
-			strbuf_addf(sb, "%"PRIuMAX, (uintmax_t)data->disk_size);
+			strbuf_add_uint(sb, data->disk_size);
 	} else if (is_atom("rest", atom, len)) {
 		if (data->mark_query)
 			data->split_on_whitespace = 1;
@@ -345,8 +356,7 @@ static int expand_atom(struct strbuf *sb, const char *atom, int len,
 		if (data->mark_query)
 			data->info.delta_base_oid = &data->delta_base_oid;
 		else
-			strbuf_addstr(sb,
-				      oid_to_hex(&data->delta_base_oid));
+			strbuf_add_oid_hex(sb, &data->delta_base_oid);
 	} else if (is_atom("objectmode", atom, len)) {
 		if (!data->mark_query && !(S_IFINVALID == data->mode))
 			strbuf_addf(sb, "%06o", data->mode);
@@ -391,7 +401,7 @@ static void print_object_or_die(struct batch_options *opt, struct expand_data *d
 			fflush(stdout);
 		if (opt->transform_mode) {
 			char *contents;
-			unsigned long size;
+			size_t size;
 
 			if (!data->rest)
 				die("missing path for '%s'", oid_to_hex(oid));
@@ -403,9 +413,12 @@ static void print_object_or_die(struct batch_options *opt, struct expand_data *d
 					    oid_to_hex(oid), data->rest);
 			} else if (opt->transform_mode == 'c') {
 				enum object_type type;
-				if (!textconv_object(the_repository,
-						     data->rest, 0100644, oid,
-						     1, &contents, &size))
+				unsigned long size_ul = 0;
+				if (textconv_object(the_repository,
+						    data->rest, 0100644, oid,
+						    1, &contents, &size_ul))
+					size = size_ul;
+				else
 					contents = odb_read_object(the_repository->objects,
 								   oid, &type, &size);
 				if (!contents)
@@ -421,7 +434,7 @@ static void print_object_or_die(struct batch_options *opt, struct expand_data *d
 	}
 	else {
 		enum object_type type;
-		unsigned long size;
+		size_t size;
 		void *contents;
 
 		contents = odb_read_object(the_repository->objects, oid,
@@ -429,11 +442,8 @@ static void print_object_or_die(struct batch_options *opt, struct expand_data *d
 		if (!contents)
 			die("object %s disappeared", oid_to_hex(oid));
 
-		if (use_mailmap) {
-			size_t s = size;
-			contents = replace_idents_using_mailmap(contents, &s);
-			size = cast_size_t_to_ulong(s);
-		}
+		if (use_mailmap)
+			contents = replace_idents_using_mailmap(contents, &size);
 
 		if (type != data->type)
 			die("object %s changed type!?", oid_to_hex(oid));
@@ -487,8 +497,7 @@ static void batch_object_write(const char *obj_name,
 			data->info.sizep = &data->size;
 
 		if (pack)
-			ret = packed_object_info(the_repository, pack,
-						 offset, &data->info);
+			ret = packed_object_info(pack, offset, &data->info);
 		else
 			ret = odb_read_object_info_extended(the_repository->objects,
 							    &data->oid, &data->info,
@@ -534,15 +543,13 @@ static void batch_object_write(const char *obj_name,
 		}
 
 		if (use_mailmap && (data->type == OBJ_COMMIT || data->type == OBJ_TAG)) {
-			size_t s = data->size;
 			char *buf = NULL;
 
 			buf = odb_read_object(the_repository->objects, &data->oid,
 					      &data->type, &data->size);
 			if (!buf)
 				die(_("unable to read %s"), oid_to_hex(&data->oid));
-			buf = replace_idents_using_mailmap(buf, &s);
-			data->size = cast_size_t_to_ulong(s);
+			buf = replace_idents_using_mailmap(buf, &data->size);
 
 			free(buf);
 		}
@@ -693,6 +700,20 @@ static void parse_cmd_info(struct batch_options *opt,
 	batch_one_object(line, output, opt, data);
 }
 
+static void parse_cmd_mailmap(struct batch_options *opt UNUSED,
+			      const char *line,
+			      struct strbuf *output UNUSED,
+			      struct expand_data *data UNUSED)
+{
+	use_mailmap = git_parse_maybe_bool(line);
+
+	if (use_mailmap < 0)
+		die(_("mailmap: invalid boolean '%s'"), line);
+
+	if (use_mailmap)
+		load_mailmap();
+}
+
 static void dispatch_calls(struct batch_options *opt,
 		struct strbuf *output,
 		struct expand_data *data,
@@ -726,9 +747,10 @@ static const struct parse_cmd {
 	parse_cmd_fn_t fn;
 	unsigned takes_args;
 } commands[] = {
-	{ "contents", parse_cmd_contents, 1},
-	{ "info", parse_cmd_info, 1},
-	{ "flush", NULL, 0},
+	{ "contents", parse_cmd_contents, 1 },
+	{ "info", parse_cmd_info, 1 },
+	{ "flush", NULL, 0 },
+	{ "mailmap", parse_cmd_mailmap, 1 },
 };
 
 static void batch_objects_command(struct batch_options *opt,
@@ -807,11 +829,14 @@ struct for_each_object_payload {
 	void *payload;
 };
 
-static int batch_one_object_loose(const struct object_id *oid,
-				  const char *path UNUSED,
-				  void *_payload)
+static int batch_one_object_oi(const struct object_id *oid,
+			       struct object_info *oi,
+			       void *_payload)
 {
 	struct for_each_object_payload *payload = _payload;
+	if (oi && oi->whence == OI_PACKED)
+		return payload->callback(oid, oi->u.packed.pack, oi->u.packed.offset,
+					 payload->payload);
 	return payload->callback(oid, NULL, 0, payload->payload);
 }
 
@@ -846,12 +871,31 @@ static void batch_each_object(struct batch_options *opt,
 		.callback = callback,
 		.payload = _payload,
 	};
-	struct bitmap_index *bitmap = prepare_bitmap_git(the_repository);
+	struct odb_for_each_object_options opts = {
+		.flags = flags,
+	};
+	struct bitmap_index *bitmap = NULL;
+	struct odb_source *source;
 
-	for_each_loose_object(the_repository->objects, batch_one_object_loose, &payload, 0);
+	/*
+	 * TODO: we still need to tap into implementation details of the object
+	 * database sources. Ideally, we should extend `odb_for_each_object()`
+	 * to handle object filters itself so that we can move the filtering
+	 * logic into the individual sources.
+	 */
+	odb_prepare_alternates(the_repository->objects);
+	for (source = the_repository->objects->sources; source; source = source->next) {
+		struct odb_source_files *files = odb_source_files_downcast(source);
+		int ret = odb_source_for_each_object(&files->loose->base, NULL, batch_one_object_oi,
+						     &payload, &opts);
+		if (ret)
+			break;
+	}
 
-	if (bitmap && !for_each_bitmapped_object(bitmap, &opt->objects_filter,
-						 batch_one_object_bitmapped, &payload)) {
+	if (opt->objects_filter.choice != LOFC_DISABLED &&
+	    (bitmap = prepare_bitmap_git(the_repository)) &&
+	    !for_each_bitmapped_object(bitmap, &opt->objects_filter,
+				       batch_one_object_bitmapped, &payload)) {
 		struct packed_git *pack;
 
 		repo_for_each_pack(the_repository, pack) {
@@ -862,8 +906,15 @@ static void batch_each_object(struct batch_options *opt,
 						&payload, flags);
 		}
 	} else {
-		for_each_packed_object(the_repository, batch_one_object_packed,
-				       &payload, flags);
+		struct object_info oi = { 0 };
+
+		for (source = the_repository->objects->sources; source; source = source->next) {
+			struct odb_source_files *files = odb_source_files_downcast(source);
+			int ret = packfile_store_for_each_object(files->packed, &oi,
+								 batch_one_object_oi, &payload, &opts);
+			if (ret)
+				break;
+		}
 	}
 
 	free_bitmap_index(bitmap);
@@ -874,6 +925,7 @@ static int batch_objects(struct batch_options *opt)
 	struct strbuf input = STRBUF_INIT;
 	struct strbuf output = STRBUF_INIT;
 	struct expand_data data = EXPAND_DATA_INIT;
+	struct repo_config_values *cfg = repo_config_values(the_repository);
 	int save_warning;
 	int retval = 0;
 
@@ -923,7 +975,7 @@ static int batch_objects(struct batch_options *opt)
 			cb.seen = &seen;
 
 			batch_each_object(opt, batch_unordered_object,
-					  FOR_EACH_OBJECT_PACK_ORDER, &cb);
+					  ODB_FOR_EACH_OBJECT_PACK_ORDER, &cb);
 
 			oidset_clear(&seen);
 		} else {
@@ -946,8 +998,8 @@ static int batch_objects(struct batch_options *opt)
 	 * warn) ends up dwarfing the actual cost of the object lookups
 	 * themselves. We can work around it by just turning off the warning.
 	 */
-	save_warning = warn_on_object_refname_ambiguity;
-	warn_on_object_refname_ambiguity = 0;
+	save_warning = cfg->warn_on_object_refname_ambiguity;
+	cfg->warn_on_object_refname_ambiguity = 0;
 
 	if (opt->batch_mode == BATCH_MODE_QUEUE_AND_DISPATCH) {
 		batch_objects_command(opt, &output, &data);
@@ -975,7 +1027,7 @@ static int batch_objects(struct batch_options *opt)
  cleanup:
 	strbuf_release(&input);
 	strbuf_release(&output);
-	warn_on_object_refname_ambiguity = save_warning;
+	cfg->warn_on_object_refname_ambiguity = save_warning;
 	return retval;
 }
 
@@ -1104,7 +1156,7 @@ int cmd_cat_file(int argc,
 	opt_epts = (opt == 'e' || opt == 'p' || opt == 't' || opt == 's');
 
 	if (use_mailmap)
-		read_mailmap(&mailmap);
+		load_mailmap();
 
 	switch (batch.objects_filter.choice) {
 	case LOFC_DISABLED:

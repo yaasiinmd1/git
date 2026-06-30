@@ -1744,6 +1744,15 @@ test_expect_success ':remotename and :remoteref' '
 	)
 '
 
+test_expect_success '%(push) with an invalid push-simple config' '
+	echo "refs/heads/main " >expect &&
+	git -c push.default=simple \
+	    -c remote.pushdefault=myfork \
+	    for-each-ref \
+	    --format="%(refname) %(push)" refs/heads/main >actual &&
+	test_cmp expect actual
+'
+
 test_expect_success "${git_for_each_ref} --ignore-case ignores case" '
 	${git_for_each_ref} --format="%(refname)" refs/heads/MAIN >actual &&
 	test_must_be_empty actual &&
@@ -1809,7 +1818,9 @@ test_expect_success "${git_for_each_ref} reports broken tags" '
 	bad=$(git hash-object -w -t tag bad) &&
 	git update-ref refs/tags/broken-tag-bad $bad &&
 	test_must_fail ${git_for_each_ref} --format="%(*objectname)" \
-		refs/tags/broken-tag-*
+		refs/tags/broken-tag-* &&
+	test_must_fail ${git_for_each_ref} --format="%(*objectname)" \
+		refs/tags/broken-tag-bad
 '
 
 test_expect_success 'set up tag with signature and no blank lines' '

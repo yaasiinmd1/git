@@ -71,7 +71,7 @@ static void internal_prefix_pathspec(struct strvec *out,
 
 		trimmed = xmemdupz(pathspec[i], to_copy);
 		maybe_basename = (flags & DUP_BASENAME) ? basename(trimmed) : trimmed;
-		prefixed_path = prefix_path(prefix, prefixlen, maybe_basename);
+		prefixed_path = prefix_path(the_repository, prefix, prefixlen, maybe_basename);
 		strvec_push(out, prefixed_path);
 
 		free(prefixed_path);
@@ -238,6 +238,7 @@ int cmd_mv(int argc,
 	struct hashmap moved_dirs = HASHMAP_INIT(pathmap_cmp, NULL);
 	struct strbuf pathbuf = STRBUF_INIT;
 	int ret;
+	struct repo_config_values *cfg = repo_config_values(the_repository);
 
 	repo_config(the_repository, git_default_config, NULL);
 
@@ -393,7 +394,8 @@ dir_check:
 			for (j = 0; j < last - first; j++) {
 				const struct cache_entry *ce = the_repository->index->cache[first + j];
 				const char *path = ce->name;
-				char *prefixed_path = prefix_path(dst_with_slash, dst_with_slash_len, path + length + 1);
+				char *prefixed_path = prefix_path(the_repository, dst_with_slash,
+								  dst_with_slash_len, path + length + 1);
 
 				strvec_push(&sources, path);
 				strvec_push(&destinations, prefixed_path);
@@ -572,8 +574,8 @@ remove_entry:
 		rename_index_entry_at(the_repository->index, pos, dst);
 
 		if (ignore_sparse &&
-		    core_apply_sparse_checkout &&
-		    core_sparse_checkout_cone) {
+		    cfg->apply_sparse_checkout &&
+		    cfg->core_sparse_checkout_cone) {
 			/*
 			 * NEEDSWORK: we are *not* paying attention to
 			 * "out-to-out" move (<source> is out-of-cone and

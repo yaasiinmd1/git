@@ -211,16 +211,21 @@ static size_t snapshot_hexsz(const struct snapshot *snapshot)
 	return snapshot->refs->base.repo->hash_algo->hexsz;
 }
 
+/*
+ * Since packed-refs is only stored in the common dir, don't parse the
+ * payload and rely on the files-backend to set 'gitdir' correctly.
+ */
 struct ref_store *packed_ref_store_init(struct repository *repo,
+					const char *payload UNUSED,
 					const char *gitdir,
-					unsigned int store_flags)
+					const struct ref_store_init_options *opts)
 {
 	struct packed_ref_store *refs = xcalloc(1, sizeof(*refs));
 	struct ref_store *ref_store = (struct ref_store *)refs;
 	struct strbuf sb = STRBUF_INIT;
 
 	base_ref_store_init(ref_store, repo, gitdir, &refs_be_packed);
-	refs->store_flags = store_flags;
+	refs->store_flags = opts->access_flags;
 
 	strbuf_addf(&sb, "%s/packed-refs", gitdir);
 	refs->path = strbuf_detach(&sb, NULL);
@@ -882,6 +887,7 @@ static int next_record(struct packed_ref_iterator *iter)
 {
 	const char *p, *eol;
 
+	memset(&iter->base.ref, 0, sizeof(iter->base.ref));
 	strbuf_reset(&iter->refname_buf);
 
 	/*
@@ -908,7 +914,7 @@ static int next_record(struct packed_ref_iterator *iter)
 	if (iter->pos == iter->eof)
 		return ITER_DONE;
 
-	iter->base.flags = REF_ISPACKED;
+	iter->base.ref.flags = REF_ISPACKED;
 	p = iter->pos;
 
 	if (iter->eof - p < snapshot_hexsz(iter->snapshot) + 2 ||
@@ -916,6 +922,7 @@ static int next_record(struct packed_ref_iterator *iter)
 	    !isspace(*p++))
 		die_invalid_line(iter->snapshot->refs->path,
 				 iter->pos, iter->eof - iter->pos);
+	iter->base.ref.oid = &iter->oid;
 
 	eol = memchr(p, '\n', iter->eof - p);
 	if (!eol)
@@ -923,22 +930,22 @@ static int next_record(struct packed_ref_iterator *iter)
 				      iter->pos, iter->eof - iter->pos);
 
 	strbuf_add(&iter->refname_buf, p, eol - p);
-	iter->base.refname = iter->refname_buf.buf;
+	iter->base.ref.name = iter->refname_buf.buf;
 
 	if (refname_contains_nul(&iter->refname_buf))
-		die("packed refname contains embedded NULL: %s", iter->base.refname);
+		die("packed refname contains embedded NULL: %s", iter->base.ref.name);
 
-	if (check_refname_format(iter->base.refname, REFNAME_ALLOW_ONELEVEL)) {
-		if (!refname_is_safe(iter->base.refname))
+	if (check_refname_format(iter->base.ref.name, REFNAME_ALLOW_ONELEVEL)) {
+		if (!refname_is_safe(iter->base.ref.name))
 			die("packed refname is dangerous: %s",
-			    iter->base.refname);
+			    iter->base.ref.name);
 		oidclr(&iter->oid, iter->repo->hash_algo);
-		iter->base.flags |= REF_BAD_NAME | REF_ISBROKEN;
+		iter->base.ref.flags |= REF_BAD_NAME | REF_ISBROKEN;
 	}
 	if (iter->snapshot->peeled == PEELED_FULLY ||
 	    (iter->snapshot->peeled == PEELED_TAGS &&
-	     starts_with(iter->base.refname, "refs/tags/")))
-		iter->base.flags |= REF_KNOWS_PEELED;
+	     starts_with(iter->base.ref.name, "refs/tags/")))
+		iter->base.ref.flags |= REF_KNOWS_PEELED;
 
 	iter->pos = eol + 1;
 
@@ -956,11 +963,12 @@ static int next_record(struct packed_ref_iterator *iter)
 		 * definitely know the value of *this* reference. But
 		 * we suppress it if the reference is broken:
 		 */
-		if ((iter->base.flags & REF_ISBROKEN)) {
+		if ((iter->base.ref.flags & REF_ISBROKEN)) {
 			oidclr(&iter->peeled, iter->repo->hash_algo);
-			iter->base.flags &= ~REF_KNOWS_PEELED;
+			iter->base.ref.flags &= ~REF_KNOWS_PEELED;
 		} else {
-			iter->base.flags |= REF_KNOWS_PEELED;
+			iter->base.ref.flags |= REF_KNOWS_PEELED;
+			iter->base.ref.peeled_oid = &iter->peeled;
 		}
 	} else {
 		oidclr(&iter->peeled, iter->repo->hash_algo);
@@ -976,15 +984,15 @@ static int packed_ref_iterator_advance(struct ref_iterator *ref_iterator)
 	int ok;
 
 	while ((ok = next_record(iter)) == ITER_OK) {
-		const char *refname = iter->base.refname;
+		const char *refname = iter->base.ref.name;
 		const char *prefix = iter->prefix;
 
-		if (iter->flags & DO_FOR_EACH_PER_WORKTREE_ONLY &&
-		    !is_per_worktree_ref(iter->base.refname))
+		if (iter->flags & REFS_FOR_EACH_PER_WORKTREE_ONLY &&
+		    !is_per_worktree_ref(iter->base.ref.name))
 			continue;
 
-		if (!(iter->flags & DO_FOR_EACH_INCLUDE_BROKEN) &&
-		    !ref_resolves_to_object(iter->base.refname, iter->repo,
+		if (!(iter->flags & REFS_FOR_EACH_INCLUDE_BROKEN) &&
+		    !ref_resolves_to_object(iter->base.ref.name, iter->repo,
 					    &iter->oid, iter->flags))
 			continue;
 
@@ -1027,22 +1035,6 @@ static int packed_ref_iterator_seek(struct ref_iterator *ref_iterator,
 	return 0;
 }
 
-static int packed_ref_iterator_peel(struct ref_iterator *ref_iterator,
-				   struct object_id *peeled)
-{
-	struct packed_ref_iterator *iter =
-		(struct packed_ref_iterator *)ref_iterator;
-
-	if ((iter->base.flags & REF_KNOWS_PEELED)) {
-		oidcpy(peeled, &iter->peeled);
-		return is_null_oid(&iter->peeled) ? -1 : 0;
-	} else if ((iter->base.flags & (REF_ISBROKEN | REF_ISSYMREF))) {
-		return -1;
-	} else {
-		return peel_object(iter->repo, &iter->oid, peeled) ? -1 : 0;
-	}
-}
-
 static void packed_ref_iterator_release(struct ref_iterator *ref_iterator)
 {
 	struct packed_ref_iterator *iter =
@@ -1056,7 +1048,6 @@ static void packed_ref_iterator_release(struct ref_iterator *ref_iterator)
 static struct ref_iterator_vtable packed_ref_iterator_vtable = {
 	.advance = packed_ref_iterator_advance,
 	.seek = packed_ref_iterator_seek,
-	.peel = packed_ref_iterator_peel,
 	.release = packed_ref_iterator_release,
 };
 
@@ -1173,7 +1164,7 @@ static struct ref_iterator *packed_ref_iterator_begin(
 	struct ref_iterator *ref_iterator;
 	unsigned int required_flags = REF_STORE_READ;
 
-	if (!(flags & DO_FOR_EACH_INCLUDE_BROKEN))
+	if (!(flags & REFS_FOR_EACH_INCLUDE_BROKEN))
 		required_flags |= REF_STORE_ODB;
 	refs = packed_downcast(ref_store, required_flags, "ref_iterator_begin");
 
@@ -1194,7 +1185,6 @@ static struct ref_iterator *packed_ref_iterator_begin(
 	iter->snapshot = snapshot;
 	acquire_snapshot(snapshot);
 	strbuf_init(&iter->refname_buf, 0);
-	iter->base.oid = &iter->oid;
 	iter->repo = ref_store->repo;
 	iter->flags = flags;
 
@@ -1416,7 +1406,7 @@ static enum ref_transaction_error write_with_updates(struct packed_ref_store *re
 	 * of updates is exhausted, leave i set to updates->nr.
 	 */
 	iter = packed_ref_iterator_begin(&refs->base, "", NULL,
-					 DO_FOR_EACH_INCLUDE_BROKEN);
+					 REFS_FOR_EACH_INCLUDE_BROKEN);
 	if ((ok = ref_iterator_advance(iter)) != ITER_OK) {
 		ref_iterator_free(iter);
 		iter = NULL;
@@ -1436,7 +1426,7 @@ static enum ref_transaction_error write_with_updates(struct packed_ref_store *re
 			if (!iter)
 				cmp = +1;
 			else
-				cmp = strcmp(iter->refname, update->refname);
+				cmp = strcmp(iter->ref.name, update->refname);
 		}
 
 		if (!cmp) {
@@ -1452,23 +1442,23 @@ static enum ref_transaction_error write_with_updates(struct packed_ref_store *re
 						    update->refname);
 					ret = REF_TRANSACTION_ERROR_CREATE_EXISTS;
 
-					if (ref_transaction_maybe_set_rejected(transaction, i, ret)) {
-						strbuf_reset(err);
+					if (ref_transaction_maybe_set_rejected(transaction, i,
+									       ret, err)) {
 						ret = 0;
 						continue;
 					}
 
 					goto error;
-				} else if (!oideq(&update->old_oid, iter->oid)) {
+				} else if (!oideq(&update->old_oid, iter->ref.oid)) {
 					strbuf_addf(err, "cannot update ref '%s': "
 						    "is at %s but expected %s",
 						    update->refname,
-						    oid_to_hex(iter->oid),
+						    oid_to_hex(iter->ref.oid),
 						    oid_to_hex(&update->old_oid));
 					ret = REF_TRANSACTION_ERROR_INCORRECT_OLD_VALUE;
 
-					if (ref_transaction_maybe_set_rejected(transaction, i, ret)) {
-						strbuf_reset(err);
+					if (ref_transaction_maybe_set_rejected(transaction, i,
+									       ret, err)) {
 						ret = 0;
 						continue;
 					}
@@ -1511,8 +1501,8 @@ static enum ref_transaction_error write_with_updates(struct packed_ref_store *re
 					    oid_to_hex(&update->old_oid));
 				ret = REF_TRANSACTION_ERROR_NONEXISTENT_REF;
 
-				if (ref_transaction_maybe_set_rejected(transaction, i, ret)) {
-					strbuf_reset(err);
+				if (ref_transaction_maybe_set_rejected(transaction, i,
+								       ret, err)) {
 					ret = 0;
 					continue;
 				}
@@ -1523,13 +1513,8 @@ static enum ref_transaction_error write_with_updates(struct packed_ref_store *re
 
 		if (cmp < 0) {
 			/* Pass the old reference through. */
-
-			struct object_id peeled;
-			int peel_error = ref_iterator_peel(iter, &peeled);
-
-			if (write_packed_entry(out, iter->refname,
-					       iter->oid,
-					       peel_error ? NULL : &peeled))
+			if (write_packed_entry(out, iter->ref.name,
+					       iter->ref.oid, iter->ref.peeled_oid))
 				goto write_error;
 
 			if ((ok = ref_iterator_advance(iter)) != ITER_OK) {
@@ -1546,14 +1531,11 @@ static enum ref_transaction_error write_with_updates(struct packed_ref_store *re
 			 */
 			i++;
 		} else {
-			struct object_id peeled;
-			int peel_error = peel_object(refs->base.repo,
-						     &update->new_oid,
-						     &peeled);
+			bool peeled = update->flags & REF_HAVE_PEELED;
 
 			if (write_packed_entry(out, update->refname,
 					       &update->new_oid,
-					       peel_error ? NULL : &peeled))
+					       peeled ? &update->peeled : NULL))
 				goto write_error;
 
 			i++;
@@ -1794,14 +1776,25 @@ cleanup:
 	return ret;
 }
 
-static int packed_pack_refs(struct ref_store *ref_store UNUSED,
-			    struct pack_refs_opts *pack_opts UNUSED)
+static int packed_optimize(struct ref_store *ref_store UNUSED,
+			   struct refs_optimize_opts *opts UNUSED)
 {
 	/*
 	 * Packed refs are already packed. It might be that loose refs
 	 * are packed *into* a packed refs store, but that is done by
 	 * updating the packed references via a transaction.
 	 */
+	return 0;
+}
+
+static int packed_optimize_required(struct ref_store *ref_store UNUSED,
+				    struct refs_optimize_opts *opts UNUSED,
+				    bool *required)
+{
+	/*
+	 * Packed refs are already optimized.
+	 */
+	*required = false;
 	return 0;
 }
 
@@ -2150,7 +2143,9 @@ struct ref_storage_be refs_be_packed = {
 	.transaction_finish = packed_transaction_finish,
 	.transaction_abort = packed_transaction_abort,
 
-	.pack_refs = packed_pack_refs,
+	.optimize = packed_optimize,
+	.optimize_required = packed_optimize_required,
+
 	.rename_ref = NULL,
 	.copy_ref = NULL,
 

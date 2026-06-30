@@ -5,11 +5,11 @@
 #include "gettext.h"
 #include "pkt-line.h"
 #include "parse-options.h"
-#include "path.h"
 #include "protocol.h"
 #include "replace-object.h"
 #include "upload-pack.h"
 #include "serve.h"
+#include "setup.h"
 #include "commit.h"
 #include "environment.h"
 
@@ -59,7 +59,7 @@ int cmd_upload_pack(int argc,
 
 	if (strict)
 		enter_repo_flags |= ENTER_REPO_STRICT;
-	if (!enter_repo(dir, enter_repo_flags))
+	if (!enter_repo(the_repository, dir, enter_repo_flags))
 		die("'%s' does not appear to be a git repository", dir);
 
 	switch (determine_protocol_version_server()) {

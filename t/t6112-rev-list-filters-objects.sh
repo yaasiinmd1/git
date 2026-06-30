@@ -483,10 +483,6 @@ test_expect_success 'combine:... with non-encoded reserved chars' '
 		"must escape char in sub-filter-spec: .\~."
 '
 
-test_expect_success 'validate err msg for "combine:<valid-filter>+"' '
-	expect_invalid_filter_spec combine:tree:2+ "expected .tree:<depth>."
-'
-
 test_expect_success 'combine:... with edge-case hex digits: Ff Aa 0 9' '
 	git -C r3 rev-list --objects --filter="combine:tree:2+bl%6Fb:n%6fne" \
 		HEAD >actual &&
@@ -627,9 +623,9 @@ test_expect_success 'verify collecting omits in combined: filter' '
 	omitted_2=$(echo a     | git hash-object --stdin) &&
 	omitted_3=$(echo abcde | git hash-object --stdin) &&
 
-	grep ~$omitted_1 actual &&
-	grep ~$omitted_2 actual &&
-	grep ~$omitted_3 actual &&
+	grep "~$omitted_1" actual &&
+	grep "~$omitted_2" actual &&
+	grep "~$omitted_3" actual &&
 	test_line_count = 3 actual
 '
 

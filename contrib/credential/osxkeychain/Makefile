@@ -1,24 +1,13 @@
 # The default target of this Makefile is...
 all:: git-credential-osxkeychain
 
--include ../../../config.mak.autogen
--include ../../../config.mak
+git-credential-osxkeychain:
+	$(MAKE) -C ../../.. contrib/credential/osxkeychain/git-credential-osxkeychain
 
-prefix ?= /usr/local
-gitexecdir ?= $(prefix)/libexec/git-core
-
-CC ?= gcc
-CFLAGS ?= -g -O2 -Wall
-RM ?= rm -f
-
-%.o: %.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ -c $<
-
-git-credential-osxkeychain: git-credential-osxkeychain.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) \
-		-framework Security -framework CoreFoundation
+install:
+	$(MAKE) -C ../../.. install-git-credential-osxkeychain
 
 clean:
-	$(RM) git-credential-osxkeychain git-credential-osxkeychain.o
+	$(MAKE) -C ../../.. clean-git-credential-osxkeychain
 
-.PHONY: all clean
+.PHONY: all git-credential-osxkeychain install clean

@@ -2,6 +2,7 @@
 #define ENVIRONMENT_H
 
 #include "repo-settings.h"
+#include "branch.h"
 
 /* Double-check local_repo_env below if you add to this list. */
 #define GIT_DIR_ENVIRONMENT "GIT_DIR"
@@ -42,6 +43,7 @@
 #define GIT_OPTIONAL_LOCKS_ENVIRONMENT "GIT_OPTIONAL_LOCKS"
 #define GIT_TEXT_DOMAIN_DIR_ENVIRONMENT "GIT_TEXTDOMAINDIR"
 #define GIT_ATTR_SOURCE_ENVIRONMENT "GIT_ATTR_SOURCE"
+#define GIT_REFERENCE_BACKEND_ENVIRONMENT "GIT_REFERENCE_BACKEND"
 
 /*
  * Environment variable used to propagate the --no-advice global option to the
@@ -84,6 +86,28 @@ extern const char * const local_repo_env[];
 
 struct strvec;
 
+struct repository;
+struct repo_config_values {
+	/* section "core" config values */
+	char *attributes_file;
+	int apply_sparse_checkout;
+	int trust_ctime;
+	int check_stat;
+	int zlib_compression_level;
+	int pack_compression_level;
+	int precomposed_unicode;
+	int core_sparse_checkout_cone;
+	int warn_on_object_refname_ambiguity;
+
+	/* section "sparse" config values */
+	int sparse_expect_files_outside_of_patterns;
+
+	/* section "branch" config values */
+	enum branch_track branch_track;
+};
+
+struct repo_config_values *repo_config_values(struct repository *repo);
+
 /*
  * Wrapper of getenv() that returns a strdup value. This value is kept
  * in argv to be freed later.
@@ -106,18 +130,15 @@ const char *strip_namespace(const char *namespaced_ref);
 
 int git_default_config(const char *, const char *,
 		       const struct config_context *, void *);
+int git_default_core_config(const char *var, const char *value,
+			    const struct config_context *ctx, void *cb);
+
+void repo_config_values_init(struct repo_config_values *cfg);
 
 /*
  * TODO: All the below state either explicitly or implicitly relies on
  * `the_repository`. We should eventually get rid of these and make the
  * dependency on a repository explicit:
- *
- *   - `setup_git_env()` ideally shouldn't exist as it modifies global state,
- *     namely the environment. The current process shouldn't ever access that
- *     state via envvars though, but should instead consult a `struct
- *     repository`. When spawning new processes, we would ideally also pass a
- *     `struct repository` and then set up the environment variables for the
- *     child process, only.
  *
  *   - `have_git_dir()` should not have to exist at all. Instead, we should
  *     decide on whether or not we have a `struct repository`.
@@ -129,7 +150,6 @@ int git_default_config(const char *, const char *,
  * Please do not add new global config variables here.
  */
 # ifdef USE_THE_REPOSITORY_VARIABLE
-void setup_git_env(const char *git_dir);
 
 /*
  * Returns true iff we have a configured git repository (either via
@@ -143,28 +163,16 @@ extern char *git_work_tree_cfg;
 
 /* Environment bits from configuration mechanism */
 extern int trust_executable_bit;
-extern int trust_ctime;
-extern int check_stat;
 extern int has_symlinks;
 extern int minimum_abbrev, default_abbrev;
 extern int ignore_case;
 extern int assume_unchanged;
-extern int warn_on_object_refname_ambiguity;
 extern char *apply_default_whitespace;
 extern char *apply_default_ignorewhitespace;
-extern char *git_attributes_file;
-extern int zlib_compression_level;
-extern int pack_compression_level;
 extern unsigned long pack_size_limit_cfg;
-extern int max_allowed_tree_depth;
 
-extern int precomposed_unicode;
 extern int protect_hfs;
 extern int protect_ntfs;
-
-extern int core_apply_sparse_checkout;
-extern int core_sparse_checkout_cone;
-extern int sparse_expect_files_outside_of_patterns;
 
 enum rebase_setup_type {
 	AUTOREBASE_NEVER = 0,

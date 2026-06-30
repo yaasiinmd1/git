@@ -88,7 +88,7 @@ static int read_patches(const char *range, struct string_list *list,
 	line = contents.buf;
 	size = contents.len;
 	for (; size > 0; size -= len, line += len) {
-		const char *p;
+		char *p;
 		char *eol;
 
 		eol = memchr(line, '\n', size);
@@ -140,7 +140,7 @@ static int read_patches(const char *range, struct string_list *list,
 			if (eol)
 				*eol = '\n';
 			orig_len = len;
-			len = parse_git_diff_header(&root, &linenr, 0, line,
+			len = parse_git_diff_header(&root, NULL, &linenr, 0, line,
 						    len, size, &patch);
 			if (len < 0) {
 				error(_("could not parse git header '%.*s'"),

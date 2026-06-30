@@ -154,27 +154,31 @@ static int cmd_rename_ref(struct ref_store *refs, const char **argv)
 	return refs_rename_ref(refs, oldref, newref, logmsg);
 }
 
-static int each_ref(const char *refname, const char *referent UNUSED, const struct object_id *oid,
-		    int flags, void *cb_data UNUSED)
+static int each_ref(const struct reference *ref, void *cb_data UNUSED)
 {
-	printf("%s %s 0x%x\n", oid_to_hex(oid), refname, flags);
+	printf("%s %s 0x%x\n", oid_to_hex(ref->oid), ref->name, ref->flags);
 	return 0;
 }
 
 static int cmd_for_each_ref(struct ref_store *refs, const char **argv)
 {
 	const char *prefix = notnull(*argv++, "prefix");
-
-	return refs_for_each_ref_in(refs, prefix, each_ref, NULL);
+	struct refs_for_each_ref_options opts = {
+		.prefix = prefix,
+		.trim_prefix = strlen(prefix),
+	};
+	return refs_for_each_ref_ext(refs, each_ref, NULL, &opts);
 }
 
 static int cmd_for_each_ref__exclude(struct ref_store *refs, const char **argv)
 {
 	const char *prefix = notnull(*argv++, "prefix");
-	const char **exclude_patterns = argv;
+	struct refs_for_each_ref_options opts = {
+		.prefix = prefix,
+		.exclude_patterns = argv,
+	};
 
-	return refs_for_each_fullref_in(refs, prefix, exclude_patterns, each_ref,
-					NULL);
+	return refs_for_each_ref_ext(refs, each_ref, NULL, &opts);
 }
 
 static int cmd_resolve_ref(struct ref_store *refs, const char **argv)
@@ -336,7 +340,7 @@ int cmd__ref_store(int argc UNUSED, const char **argv)
 	const char *func;
 	struct command *cmd;
 
-	setup_git_directory();
+	setup_git_directory(the_repository);
 
 	argv = get_store(argv + 1, &refs);
 

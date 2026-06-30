@@ -527,7 +527,7 @@ test_expect_success 'goto hunk 1 with "g 1"' '
 	_10
 	+15
 	_20
-	(1/2) Stage this hunk [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]?_
+	(1/2) Stage this hunk (was: y) [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]?_
 	EOF
 	test_write_lines s y g 1 | git add -p >actual &&
 	tail -n 7 <actual >actual.trimmed &&
@@ -540,7 +540,7 @@ test_expect_success 'goto hunk 1 with "g1"' '
 	_10
 	+15
 	_20
-	(1/2) Stage this hunk [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]?_
+	(1/2) Stage this hunk (was: y) [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]?_
 	EOF
 	test_write_lines s y g1 | git add -p >actual &&
 	tail -n 4 <actual >actual.trimmed &&
@@ -554,7 +554,7 @@ test_expect_success 'navigate to hunk via regex /pattern' '
 	_10
 	+15
 	_20
-	(1/2) Stage this hunk [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]?_
+	(1/2) Stage this hunk (was: y) [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]?_
 	EOF
 	test_write_lines s y /1,2 | git add -p >actual &&
 	tail -n 5 <actual >actual.trimmed &&
@@ -567,7 +567,7 @@ test_expect_success 'navigate to hunk via regex / pattern' '
 	_10
 	+15
 	_20
-	(1/2) Stage this hunk [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]?_
+	(1/2) Stage this hunk (was: y) [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]?_
 	EOF
 	test_write_lines s y / 1,2 | git add -p >actual &&
 	tail -n 4 <actual >actual.trimmed &&
@@ -579,11 +579,11 @@ test_expect_success 'print again the hunk' '
 	tr _ " " >expect <<-EOF &&
 	+15
 	 20
-	(1/2) Stage this hunk [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]? @@ -1,2 +1,3 @@
+	(1/2) Stage this hunk (was: y) [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]? @@ -1,2 +1,3 @@
 	 10
 	+15
 	 20
-	(1/2) Stage this hunk [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]?_
+	(1/2) Stage this hunk (was: y) [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]?_
 	EOF
 	test_write_lines s y g 1 p | git add -p >actual &&
 	tail -n 7 <actual >actual.trimmed &&
@@ -595,11 +595,11 @@ test_expect_success TTY 'print again the hunk (PAGER)' '
 	cat >expect <<-EOF &&
 	<GREEN>+<RESET><GREEN>15<RESET>
 	 20<RESET>
-	<BOLD;BLUE>(1/2) Stage this hunk [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]? <RESET>PAGER <CYAN>@@ -1,2 +1,3 @@<RESET>
+	<BOLD;BLUE>(1/2) Stage this hunk (was: y) [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]? <RESET>PAGER <CYAN>@@ -1,2 +1,3 @@<RESET>
 	PAGER  10<RESET>
 	PAGER <GREEN>+<RESET><GREEN>15<RESET>
 	PAGER  20<RESET>
-	<BOLD;BLUE>(1/2) Stage this hunk [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]? <RESET>
+	<BOLD;BLUE>(1/2) Stage this hunk (was: y) [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]? <RESET>
 	EOF
 	test_write_lines s y g 1 P |
 	(
@@ -810,7 +810,7 @@ test_expect_success 'colors can be overridden' '
 	<BOLD>-old<RESET>
 	<BLUE>+new<RESET>
 	<CYAN> more-context<RESET>
-	<YELLOW>(1/2) Stage this hunk [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]? <RESET>
+	<YELLOW>(1/2) Stage this hunk (was: y) [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]? <RESET>
 	EOF
 	test_cmp expect actual
 '
@@ -1429,6 +1429,117 @@ test_expect_success 'invalid option s is rejected' '
 	(2/2) Stage this hunk [y,n,q,a,d,k,K,j,J,g,/,e,p,P,?]?
 	EOF
 	test_cmp expect actual
+'
+
+test_expect_success 'EOF quits' '
+	echo a >file &&
+	echo a >file2 &&
+	git add file file2 &&
+	echo X >file &&
+	echo X >file2 &&
+	git add -p </dev/null >out &&
+	test_grep file out &&
+	test_grep ! file2 out
+'
+for cmd in add checkout reset "stash save" "stash push"
+do
+	test_expect_success "$cmd rejects invalid --no-auto-advance options" '
+		test_must_fail git $cmd --no-auto-advance 2>actual &&
+		test_grep -E  "requires .*--(interactive|patch)" actual
+	'
+done
+
+test_expect_success 'manual advance (">") moves to next file with --no-auto-advance' '
+	git reset --hard &&
+	echo line1 >first-file &&
+	echo line2 >second-file &&
+	git add -A &&
+	git commit -m initial >/dev/null 2>&1 &&
+	echo change_first >>first-file &&
+	echo change_second >>second-file &&
+
+	printf ">\nq\n" | git add -p --no-auto-advance >output.test 2>&1 &&
+	test_grep  -E "(a|b)/second-file" output.test
+'
+
+test_expect_success 'select n on a hunk, go to another file, come back and change to y stages' '
+	git reset --hard &&
+	echo one >f1 &&
+	echo one >f2 &&
+	git add -A &&
+	git commit -m initial >/dev/null 2>&1 &&
+	echo change1 >>f1 &&
+	echo change2 >>f2 &&
+
+	printf "n\n>\n<\ny\nq\n" | git add -p --no-auto-advance >output.staged 2>&1 &&
+	git diff --cached --name-only >staged &&
+	test_grep -E "(a/f1)" output.staged
+'
+
+test_expect_success 'select y on a hunk, go to another file, come back and change to n does not stage' '
+	git reset --hard &&
+	echo one >f1 &&
+	echo one >f2 &&
+	git add -A &&
+	git commit -m initial >/dev/null 2>&1 &&
+	echo change1 >>f1 &&
+	echo change2 >>f2 &&
+
+	printf "y\n>\n<\nn\nq\n" | git add -p --no-auto-advance >output.unstaged 2>&1 &&
+	git diff --cached --name-only >staged &&
+	test_must_be_empty staged
+'
+
+test_expect_success 'deciding all hunks in a file does not auto advance' '
+	git reset --hard &&
+	echo line >stay &&
+	echo line >other &&
+	git add -A &&
+	git commit -m initial >/dev/null 2>&1 &&
+	echo change >>stay &&
+	echo change >>other &&
+	test_write_lines y | git add -p --no-auto-advance >raw-output 2>&1 &&
+	test_grep "(1/1) Stage this hunk (was: y)" raw-output &&
+	test_grep ! "diff --git a/stay b/stay" raw-output
+'
+test_expect_success 'HUNKS SUMMARY does not show in help text when there are undecided hunks' '
+	git reset --hard &&
+	test_write_lines 1 2 3 4 5 6 7 8 9 >f &&
+	git add f &&
+	git commit -m initial >/dev/null 2>&1 &&
+	test_write_lines 1 X 3 4 Y 6 7 Z 9 >f &&
+	test_write_lines s y n | git add -p --no-auto-advance >raw-nostat 2>&1 &&
+	test_grep ! "HUNKS SUMMARY - Hunks: " raw-nostat
+'
+
+test_expect_success 'help text shows HUNK SUMMARY when all hunks have been decided' '
+	git reset --hard &&
+	test_write_lines 1 2 3 4 5 6 7 8 9 >f2 &&
+	git add f2 &&
+	git commit -m initial >/dev/null 2>&1 &&
+	test_write_lines 1 X 3 4 Y 6 7 Z 9 >f2 &&
+	printf "s\ny\nn\ny\n?\n" | git add -p --no-auto-advance >raw-stat 2>&1 &&
+	test_grep "HUNKS SUMMARY - Hunks: 3, USE: 2, SKIP: 1" raw-stat
+'
+
+test_expect_success 'selective staging across multiple files with --no-advance' '
+	git reset --hard &&
+	test_write_lines 1 2 3 4 5 6 7 8 9 >a.file &&
+	test_write_lines 1 2 3 4 5 6 7 8 9 >b.file &&
+	test_write_lines 1 2 3 4 5 6 7 8 9 >c.file &&
+	git add -A &&
+	git commit -m initial >/dev/null 2>&1 &&
+	test_write_lines 1 A2 3 4 A5 6 7 8 9 >a.file &&
+	test_write_lines 1 2 B3 4 5 6 7 B8 9 >b.file &&
+	test_write_lines C1 2 3 4 5 C6 7 8 9 >c.file &&
+	printf "s\ny\nn\n>\ns\nn\ny\n>\ns\ny\ny\nq\n" | git add -p --no-auto-advance >output.index 2>&1 &&
+	git diff --cached >staged.diff &&
+	test_grep "+A2" staged.diff &&
+	test_grep ! "+A5" staged.diff &&
+	test_grep "+B8" staged.diff &&
+	test_grep ! "+B3" staged.diff &&
+	test_grep "+C1" staged.diff &&
+	test_grep "+C6" staged.diff
 '
 
 test_done

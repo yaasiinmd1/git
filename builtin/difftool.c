@@ -319,7 +319,7 @@ static char *get_symlink(struct repository *repo,
 		data = strbuf_detach(&link, NULL);
 	} else {
 		enum object_type type;
-		unsigned long size;
+		size_t size;
 		data = odb_read_object(repo->objects, oid, &type, &size);
 		if (!data)
 			die(_("could not read object %s for symlink %s"),
@@ -767,7 +767,7 @@ int cmd_difftool(int argc,
 		die(_("difftool requires worktree or --no-index"));
 
 	if (!no_index){
-		setup_work_tree();
+		setup_work_tree(repo);
 		setenv(GIT_DIR_ENVIRONMENT, absolute_path(repo_get_git_dir(repo)), 1);
 		setenv(GIT_WORK_TREE_ENVIRONMENT, absolute_path(repo_get_work_tree(repo)), 1);
 	} else if (dir_diff)

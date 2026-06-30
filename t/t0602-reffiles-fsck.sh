@@ -87,6 +87,47 @@ test_expect_success 'ref name should be checked' '
 	)
 '
 
+test_expect_success 'lock files should be ignored' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		git commit --allow-empty -m initial &&
+		git checkout -b branch-1 &&
+
+		touch .git/refs/heads/branch-1.lock &&
+		git refs verify 2>err &&
+		test_must_be_empty err &&
+
+		echo "foobar" >.git/refs/heads/branch-2 &&
+		test_must_fail git refs verify 2>err &&
+		cat >expect <<-EOF &&
+		error: refs/heads/branch-2: badRefContent: foobar
+		EOF
+		test_cmp expect err
+	)
+'
+
+test_expect_success 'bare lock files should not be ignored' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		git commit --allow-empty -m initial &&
+		git checkout -b branch-1 &&
+
+		# invalid refname should be reported
+		cp .git/refs/heads/branch-1 .git/refs/heads/.branch-1.lock &&
+		# invalid refname and content should be reported
+		touch .git/refs/heads/.lock &&
+
+		test_must_fail git refs verify 2>err &&
+		test_grep "error: refs/heads/.branch-1.lock: badRefName: invalid refname format" err &&
+		test_grep "error: refs/heads/.lock: badRefName: invalid refname format" err &&
+		test_grep "error: refs/heads/.lock: badRefContent: " err
+	)
+'
+
 test_expect_success 'ref name check should be adapted into fsck messages' '
 	test_when_finished "rm -rf repo" &&
 	git init repo &&
@@ -902,6 +943,36 @@ test_expect_success '--[no-]references option should apply to fsck' '
 			rm $branch_dir_prefix/branch-garbage &&
 			test_must_be_empty err || return 1
 		done
+	)
+'
+
+test_expect_success 'complains about broken root ref' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		echo "ref: refs/heads/../HEAD" >.git/HEAD &&
+		test_must_fail git refs verify 2>err &&
+		cat >expect <<-EOF &&
+		error: HEAD: badReferentName: points to invalid refname ${SQ}refs/heads/../HEAD${SQ}
+		EOF
+		test_cmp expect err
+	)
+'
+
+test_expect_success 'complains about broken root ref in worktree' '
+	test_when_finished "rm -rf repo worktree" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit initial &&
+		git worktree add ../worktree &&
+		echo "ref: refs/heads/../HEAD" >.git/worktrees/worktree/HEAD &&
+		test_must_fail git refs verify 2>err &&
+		cat >expect <<-EOF &&
+		error: worktrees/worktree/HEAD: badReferentName: points to invalid refname ${SQ}refs/heads/../HEAD${SQ}
+		EOF
+		test_cmp expect err
 	)
 '
 

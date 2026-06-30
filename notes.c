@@ -796,7 +796,7 @@ static int prune_notes_helper(const struct object_id *object_oid,
 	struct note_delete_list *n;
 
 	if (odb_has_object(the_repository->objects, object_oid,
-			   HAS_OBJECT_RECHECK_PACKED | HAS_OBJECT_FETCH_PROMISOR))
+			   ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR))
 		return 0; /* nothing to do for this note */
 
 	/* failed to find object => prune this note */
@@ -811,7 +811,8 @@ int combine_notes_concatenate(struct object_id *cur_oid,
 			      const struct object_id *new_oid)
 {
 	char *cur_msg = NULL, *new_msg = NULL, *buf;
-	unsigned long cur_len, new_len, buf_len;
+	unsigned long buf_len;
+	size_t cur_len, new_len;
 	enum object_type cur_type, new_type;
 	int ret;
 
@@ -875,7 +876,7 @@ static int string_list_add_note_lines(struct string_list *list,
 				      const struct object_id *oid)
 {
 	char *data;
-	unsigned long len;
+	size_t len;
 	enum object_type t;
 
 	if (is_null_oid(oid))
@@ -921,8 +922,7 @@ int combine_notes_cat_sort_uniq(struct object_id *cur_oid,
 	if (string_list_add_note_lines(&sort_uniq_list, new_oid))
 		goto out;
 	string_list_remove_empty_items(&sort_uniq_list, 0);
-	string_list_sort(&sort_uniq_list);
-	string_list_remove_duplicates(&sort_uniq_list, 0);
+	string_list_sort_u(&sort_uniq_list, 0);
 
 	/* create a new blob object from sort_uniq_list */
 	if (for_each_string_list(&sort_uniq_list,
@@ -938,13 +938,11 @@ out:
 	return ret;
 }
 
-static int string_list_add_one_ref(const char *refname, const char *referent UNUSED,
-				   const struct object_id *oid UNUSED,
-				   int flag UNUSED, void *cb)
+static int string_list_add_one_ref(const struct reference *ref, void *cb)
 {
 	struct string_list *refs = cb;
-	if (!unsorted_string_list_has_string(refs, refname))
-		string_list_append(refs, refname);
+	if (!unsorted_string_list_has_string(refs, ref->name))
+		string_list_append(refs, ref->name);
 	return 0;
 }
 
@@ -955,8 +953,11 @@ void string_list_add_refs_by_glob(struct string_list *list, const char *glob)
 {
 	assert(list->strdup_strings);
 	if (has_glob_specials(glob)) {
-		refs_for_each_glob_ref(get_main_ref_store(the_repository),
-				       string_list_add_one_ref, glob, list);
+		struct refs_for_each_ref_options opts = {
+			.pattern = glob,
+		};
+		refs_for_each_ref_ext(get_main_ref_store(the_repository),
+				      string_list_add_one_ref, list, &opts);
 	} else {
 		struct object_id oid;
 		if (repo_get_oid(the_repository, glob, &oid))
@@ -1282,7 +1283,8 @@ static void format_note(struct notes_tree *t, const struct object_id *object_oid
 	static const char utf8[] = "utf-8";
 	const struct object_id *oid;
 	char *msg, *msg_p;
-	unsigned long linelen, msglen;
+	unsigned long linelen;
+	size_t msglen;
 	enum object_type type;
 
 	if (!t)

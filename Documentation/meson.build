@@ -55,6 +55,7 @@ manpages = {
   'git-for-each-ref.adoc' : 1,
   'git-for-each-repo.adoc' : 1,
   'git-format-patch.adoc' : 1,
+  'git-format-rev.adoc' : 1,
   'git-fsck-objects.adoc' : 1,
   'git-fsck.adoc' : 1,
   'git-fsmonitor--daemon.adoc' : 1,
@@ -64,6 +65,7 @@ manpages = {
   'git-gui.adoc' : 1,
   'git-hash-object.adoc' : 1,
   'git-help.adoc' : 1,
+  'git-history.adoc' : 1,
   'git-hook.adoc' : 1,
   'git-http-backend.adoc' : 1,
   'git-http-fetch.adoc' : 1,
@@ -154,6 +156,7 @@ manpages = {
   'git-update-server-info.adoc' : 1,
   'git-upload-archive.adoc' : 1,
   'git-upload-pack.adoc' : 1,
+  'git-url-parse.adoc' : 1,
   'git-var.adoc' : 1,
   'git-verify-commit.adoc' : 1,
   'git-verify-pack.adoc' : 1,
@@ -193,6 +196,7 @@ manpages = {
   'gitcore-tutorial.adoc' : 7,
   'gitcredentials.adoc' : 7,
   'gitcvs-migration.adoc' : 7,
+  'gitdatamodel.adoc' : 7,
   'gitdiffcore.adoc' : 7,
   'giteveryday.adoc' : 7,
   'gitfaq.adoc' : 7,
@@ -352,12 +356,9 @@ foreach mode : [ 'diff', 'merge' ]
     command: [
       shell,
       '@INPUT@',
-      '..',
+      meson.project_source_root(),
       mode,
       '@OUTPUT@'
-    ],
-    env: [
-      'MERGE_TOOLS_DIR=' + meson.project_source_root() / 'mergetools',
     ],
     input: 'generate-mergetool-list.sh',
     output: 'mergetools-' + mode + '.adoc',
@@ -412,7 +413,7 @@ foreach manpage, category : manpages
       input: manpage,
       output: fs.stem(manpage) + '.html',
       install: true,
-      install_dir: get_option('datadir') / 'doc/git-doc',
+      install_dir: htmldir,
     )
   endif
 endforeach
@@ -423,7 +424,7 @@ if get_option('docs').contains('html')
     output: 'docinfo.html',
     copy: true,
     install: true,
-    install_dir: get_option('datadir') / 'doc/git-doc',
+    install_dir: htmldir,
   )
 
   configure_file(
@@ -431,11 +432,11 @@ if get_option('docs').contains('html')
     output: 'docbook-xsl.css',
     copy: true,
     install: true,
-    install_dir: get_option('datadir') / 'doc/git-doc',
+    install_dir: htmldir,
   )
 
   install_symlink('index.html',
-    install_dir: get_option('datadir') / 'doc/git-doc',
+    install_dir: htmldir,
     pointing_to: 'git.html',
   )
 
@@ -466,7 +467,7 @@ if get_option('docs').contains('html')
     input: 'docbook.xsl',
     output: 'user-manual.html',
     install: true,
-    install_dir: get_option('datadir') / 'doc/git-doc',
+    install_dir: htmldir,
   )
 
   articles = [
@@ -492,7 +493,7 @@ if get_option('docs').contains('html')
       output: fs.stem(article) + '.html',
       depends: documentation_deps,
       install: true,
-      install_dir: get_option('datadir') / 'doc/git-doc',
+      install_dir: htmldir,
     )
   endforeach
 

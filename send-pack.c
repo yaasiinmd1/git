@@ -175,8 +175,8 @@ static int receive_status(struct repository *r,
 	ret = receive_unpack_status(reader);
 	while (1) {
 		struct object_id old_oid, new_oid;
-		const char *head;
-		const char *refname;
+		char *head;
+		char *refname;
 		char *p;
 		if (packet_reader_read(reader) != PACKET_READ_NORMAL)
 			break;
@@ -190,7 +190,8 @@ static int receive_status(struct repository *r,
 		*p++ = '\0';
 
 		if (!strcmp(head, "option")) {
-			const char *key, *val;
+			char *key;
+			const char *val;
 
 			if (!hint || !(report || new_report)) {
 				if (!once++)
@@ -391,7 +392,7 @@ static int generate_push_cert(struct strbuf *req_buf,
 	if (!update_seen)
 		goto free_return;
 
-	if (sign_buffer(&cert, &cert, signing_key))
+	if (sign_buffer(&cert, &cert, signing_key, 0))
 		die(_("failed to sign the push certificate"));
 
 	packet_buf_write(req_buf, "push-cert%c%s", 0, cap_string);
@@ -433,28 +434,48 @@ static void reject_invalid_nonce(const char *nonce, int len)
 
 static void get_commons_through_negotiation(struct repository *r,
 					    const char *url,
+					    const struct string_list *negotiation_include,
+					    const struct string_list *negotiation_restrict,
 					    const struct ref *remote_refs,
 					    struct oid_array *commons)
 {
 	struct child_process child = CHILD_PROCESS_INIT;
 	const struct ref *ref;
 	int len = r->hash_algo->hexsz + 1; /* hash + NL */
-	int nr_negotiation_tip = 0;
+	int nr_negotiation = 0;
 
 	child.git_cmd = 1;
 	child.no_stdin = 1;
 	child.out = -1;
 	strvec_pushl(&child.args, "fetch", "--negotiate-only", NULL);
-	for (ref = remote_refs; ref; ref = ref->next) {
-		if (!is_null_oid(&ref->new_oid)) {
-			strvec_pushf(&child.args, "--negotiation-tip=%s",
-				     oid_to_hex(&ref->new_oid));
-			nr_negotiation_tip++;
+
+	if (negotiation_restrict && negotiation_restrict->nr) {
+		struct string_list_item *item;
+		for_each_string_list_item(item, negotiation_restrict)
+			strvec_pushf(&child.args, "--negotiation-restrict=%s",
+				     item->string);
+		nr_negotiation = negotiation_restrict->nr;
+	} else {
+		for (ref = remote_refs; ref; ref = ref->next) {
+			if (!is_null_oid(&ref->new_oid)) {
+				strvec_pushf(&child.args, "--negotiation-restrict=%s",
+					     oid_to_hex(&ref->new_oid));
+				nr_negotiation++;
+			}
 		}
 	}
+
+	if (negotiation_include && negotiation_include->nr) {
+		struct string_list_item *item;
+		for_each_string_list_item(item, negotiation_include)
+			strvec_pushf(&child.args, "--negotiation-include=%s",
+				     item->string);
+		nr_negotiation += negotiation_include->nr;
+	}
+
 	strvec_push(&child.args, url);
 
-	if (!nr_negotiation_tip) {
+	if (!nr_negotiation) {
 		child_process_clear(&child);
 		return;
 	}
@@ -528,7 +549,10 @@ int send_pack(struct repository *r,
 	repo_config_get_bool(r, "push.negotiate", &push_negotiate);
 	if (push_negotiate) {
 		trace2_region_enter("send_pack", "push_negotiate", r);
-		get_commons_through_negotiation(r, args->url, remote_refs, &commons);
+		get_commons_through_negotiation(r, args->url,
+					       args->negotiation_include,
+					       args->negotiation_restrict,
+					       remote_refs, &commons);
 		trace2_region_leave("send_pack", "push_negotiate", r);
 	}
 

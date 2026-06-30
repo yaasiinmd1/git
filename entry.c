@@ -2,13 +2,13 @@
 
 #include "git-compat-util.h"
 #include "odb.h"
+#include "odb/streaming.h"
 #include "dir.h"
 #include "environment.h"
 #include "gettext.h"
 #include "hex.h"
 #include "name-hash.h"
 #include "sparse-index.h"
-#include "streaming.h"
 #include "submodule.h"
 #include "symlinks.h"
 #include "progress.h"
@@ -92,11 +92,9 @@ static int create_file(const char *path, unsigned int mode)
 void *read_blob_entry(const struct cache_entry *ce, size_t *size)
 {
 	enum object_type type;
-	unsigned long ul;
 	void *blob_data = odb_read_object(the_repository->objects, &ce->oid,
-					  &type, &ul);
+					  &type, size);
 
-	*size = ul;
 	if (blob_data) {
 		if (type == OBJ_BLOB)
 			return blob_data;
@@ -139,7 +137,7 @@ static int streaming_write_entry(const struct cache_entry *ce, char *path,
 	if (fd < 0)
 		return -1;
 
-	result |= stream_blob_to_fd(fd, &ce->oid, filter, 1);
+	result |= odb_stream_blob_to_fd(the_repository->objects, fd, &ce->oid, filter, 1);
 	*fstat_done = fstat_checkout_output(fd, state, statbuf);
 	result |= close(fd);
 
@@ -443,7 +441,8 @@ static int check_path(const char *path, int len, struct stat *st, int skiplen)
 static void mark_colliding_entries(const struct checkout *state,
 				   struct cache_entry *ce, struct stat *st)
 {
-	int trust_ino = check_stat;
+	struct repo_config_values *cfg = repo_config_values(the_repository);
+	int trust_ino = cfg->check_stat;
 
 #if defined(GIT_WINDOWS_NATIVE) || defined(__CYGWIN__)
 	trust_ino = 0;

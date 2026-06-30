@@ -66,13 +66,11 @@ const char *repo_git_path_replace(struct repository *repo,
 
 /*
  * Similar to repo_git_path() but can produce paths for a specified
- * worktree instead of current one. When no worktree is given, then the path is
- * computed relative to main worktree of the given repository.
+ * worktree instead of current one.
  */
-const char *worktree_git_path(struct repository *r,
-			      const struct worktree *wt,
+const char *worktree_git_path(const struct worktree *wt,
 			      const char *fmt, ...)
-	__attribute__((format (printf, 3, 4)));
+	__attribute__((format (printf, 2, 3)));
 
 /*
  * The `repo_worktree_path` family of functions will construct a path into a
@@ -114,6 +112,12 @@ const char *repo_submodule_path_replace(struct repository *repo,
 					const char *fmt, ...)
 	__attribute__((format (printf, 4, 5)));
 
+/*
+ * Given a directory name 'dir' (not ending with a trailing '/'),
+ * determine if 'buf' is equal to 'dir' or has prefix 'dir'+'/'.
+ */
+int dir_prefix(const char *buf, const char *dir);
+
 void report_linked_checkout_garbage(struct repository *r);
 
 /*
@@ -146,21 +150,6 @@ int adjust_shared_perm(struct repository *repo, const char *path);
 
 char *interpolate_path(const char *path, int real_home);
 
-/* The bits are as follows:
- *
- * - ENTER_REPO_STRICT: callers that require exact paths (as opposed
- *   to allowing known suffixes like ".git", ".git/.git" to be
- *   omitted) can set this bit.
- *
- * - ENTER_REPO_ANY_OWNER_OK: callers that are willing to run without
- *   ownership check can set this bit.
- */
-enum {
-	ENTER_REPO_STRICT = (1<<0),
-	ENTER_REPO_ANY_OWNER_OK = (1<<1),
-};
-
-const char *enter_repo(const char *path, unsigned flags);
 const char *remove_leading_path(const char *in, const char *prefix);
 const char *relative_path(const char *in, const char *prefix, struct strbuf *sb);
 int normalize_path_copy_len(char *dst, const char *src, int *prefix_len);
@@ -228,7 +217,7 @@ void safe_create_dir(struct repository *repo, const char *dir, int share);
  *
  *   - It always adjusts shared permissions.
  *
- * Returns a negative erorr code on error, 0 on success.
+ * Returns a negative error code on error, 0 on success.
  */
 int safe_create_dir_in_gitdir(struct repository *repo, const char *path);
 

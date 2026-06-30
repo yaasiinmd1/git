@@ -160,7 +160,7 @@ static int handle_path_include(const struct key_value_info *kvi,
 	 * based on the including config file.
 	 */
 	if (!is_absolute_path(path)) {
-		char *slash;
+		const char *slash;
 
 		if (!kvi || kvi->origin_type != CONFIG_ORIGIN_FILE) {
 			ret = error(_("relative config includes must come from files"));
@@ -536,11 +536,14 @@ static inline int iskeychar(int c)
  * -2 if there is no section name in the key.
  *
  * store_key - pointer to char* which will hold a copy of the key with
- *             lowercase section and variable name
+ *             lowercase section and variable name, can be NULL to skip
+ *             allocation when only validation is needed
  * baselen - pointer to size_t which will hold the length of the
  *           section + subsection part, can be NULL
+ * quiet - when non-zero, suppress error() reports on rejection
  */
-int git_config_parse_key(const char *key, char **store_key, size_t *baselen_)
+static int do_parse_config_key(const char *key, char **store_key,
+			       size_t *baselen_, int quiet)
 {
 	size_t i, baselen;
 	int dot;
@@ -552,12 +555,14 @@ int git_config_parse_key(const char *key, char **store_key, size_t *baselen_)
 	 */
 
 	if (last_dot == NULL || last_dot == key) {
-		error(_("key does not contain a section: %s"), key);
+		if (!quiet)
+			error(_("key does not contain a section: %s"), key);
 		return -CONFIG_NO_SECTION_OR_NAME;
 	}
 
 	if (!last_dot[1]) {
-		error(_("key does not contain variable name: %s"), key);
+		if (!quiet)
+			error(_("key does not contain variable name: %s"), key);
 		return -CONFIG_NO_SECTION_OR_NAME;
 	}
 
@@ -568,7 +573,8 @@ int git_config_parse_key(const char *key, char **store_key, size_t *baselen_)
 	/*
 	 * Validate the key and while at it, lower case it for matching.
 	 */
-	*store_key = xmallocz(strlen(key));
+	if (store_key)
+		*store_key = xmallocz(strlen(key));
 
 	dot = 0;
 	for (i = 0; key[i]; i++) {
@@ -579,22 +585,36 @@ int git_config_parse_key(const char *key, char **store_key, size_t *baselen_)
 		if (!dot || i > baselen) {
 			if (!iskeychar(c) ||
 			    (i == baselen + 1 && !isalpha(c))) {
-				error(_("invalid key: %s"), key);
+				if (!quiet)
+					error(_("invalid key: %s"), key);
 				goto out_free_ret_1;
 			}
 			c = tolower(c);
 		} else if (c == '\n') {
-			error(_("invalid key (newline): %s"), key);
+			if (!quiet)
+				error(_("invalid key (newline): %s"), key);
 			goto out_free_ret_1;
 		}
-		(*store_key)[i] = c;
+		if (store_key)
+			(*store_key)[i] = c;
 	}
 
 	return 0;
 
 out_free_ret_1:
-	FREE_AND_NULL(*store_key);
+	if (store_key)
+		FREE_AND_NULL(*store_key);
 	return -CONFIG_INVALID_KEY;
+}
+
+int git_config_parse_key(const char *key, char **store_key, size_t *baselen_)
+{
+	return do_parse_config_key(key, store_key, baselen_, 0);
+}
+
+int git_config_key_is_valid(const char *key)
+{
+	return !do_parse_config_key(key, NULL, NULL, 1);
 }
 
 static int config_parse_pair(const char *key, const char *value,
@@ -1212,6 +1232,15 @@ int git_config_int(const char *name, const char *value,
 	return ret;
 }
 
+unsigned int git_config_uint(const char *name, const char *value,
+			     const struct key_value_info *kvi)
+{
+	unsigned int ret;
+	if (!git_parse_uint(value, &ret))
+		die_bad_number(name, value, kvi);
+	return ret;
+}
+
 int64_t git_config_int64(const char *name, const char *value,
 			 const struct key_value_info *kvi)
 {
@@ -1278,7 +1307,7 @@ int git_config_string(char **dest, const char *var, const char *value)
 
 int git_config_pathname(char **dest, const char *var, const char *value)
 {
-	int is_optional;
+	bool is_optional;
 	char *path;
 
 	if (!value)
@@ -1291,6 +1320,7 @@ int git_config_pathname(char **dest, const char *var, const char *value)
 
 	if (is_optional && is_missing_file(path)) {
 		free(path);
+		*dest = NULL;
 		return 0;
 	}
 
@@ -1432,7 +1462,7 @@ int git_config_from_blob_oid(config_fn_t fn,
 {
 	enum object_type type;
 	char *buf;
-	unsigned long size;
+	size_t size;
 	int ret;
 
 	buf = odb_read_object(repo->objects, oid, &type, &size);
@@ -1906,6 +1936,18 @@ int git_configset_get_int(struct config_set *set, const char *key, int *dest)
 		return 1;
 }
 
+int git_configset_get_uint(struct config_set *set, const char *key, unsigned int *dest)
+{
+	const char *value;
+	struct key_value_info kvi;
+
+	if (!git_configset_get_value(set, key, &value, &kvi)) {
+		*dest = git_config_uint(key, value, &kvi);
+		return 0;
+	} else
+		return 1;
+}
+
 int git_configset_get_ulong(struct config_set *set, const char *key, unsigned long *dest)
 {
 	const char *value;
@@ -1953,7 +1995,7 @@ int git_configset_get_maybe_bool(struct config_set *set, const char *key, int *d
 		return 1;
 }
 
-int git_configset_get_pathname(struct config_set *set, const char *key, char **dest)
+static int git_configset_get_pathname(struct config_set *set, const char *key, char **dest)
 {
 	const char *value;
 	if (!git_configset_get_value(set, key, &value, NULL))
@@ -2355,6 +2397,13 @@ int repo_config_get_int(struct repository *repo,
 	return git_configset_get_int(repo->config, key, dest);
 }
 
+int repo_config_get_uint(struct repository *repo,
+			 const char *key, unsigned int *dest)
+{
+	git_config_check_init(repo);
+	return git_configset_get_uint(repo->config, key, dest);
+}
+
 int repo_config_get_ulong(struct repository *repo,
 			  const char *key, unsigned long *dest)
 {
@@ -2434,14 +2483,14 @@ int repo_config_get_expiry_in_days(struct repository *r, const char *key,
 				   timestamp_t *expiry, timestamp_t now)
 {
 	const char *expiry_string;
-	intmax_t days;
+	int days;
 	timestamp_t when;
 
 	if (repo_config_get_string_tmp(r, key, &expiry_string))
 		return 1; /* no such thing */
 
-	if (git_parse_signed(expiry_string, &days, maximum_signed_value_of_type(int))) {
-		const int scale = 86400;
+	if (git_parse_int(expiry_string, &days)) {
+		const intmax_t scale = 86400;
 		*expiry = now - days * scale;
 		return 0;
 	}

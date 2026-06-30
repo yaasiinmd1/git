@@ -29,11 +29,13 @@
 #include "object-file.h"
 #include "object-name.h"
 #include "odb.h"
+#include "odb/source.h"
 #include "advice.h"
 #include "branch.h"
 #include "list-objects-filter-options.h"
 #include "wildmatch.h"
 #include "strbuf.h"
+#include "url.h"
 
 #define OPT_QUIET (1 << 0)
 #define OPT_CACHED (1 << 1)
@@ -109,6 +111,43 @@ static int get_default_remote_submodule(const char *module_path, char **default_
 	repo_clear(&subrepo);
 	free(url);
 
+	return 0;
+}
+
+static int module_get_default_remote(int argc, const char **argv, const char *prefix,
+				     struct repository *repo UNUSED)
+{
+	const char *path;
+	char *resolved_path = NULL;
+	char *default_remote = NULL;
+	int code;
+	struct option options[] = {
+		OPT_END()
+	};
+	const char *const usage[] = {
+		N_("git submodule--helper get-default-remote <path>"),
+		NULL
+	};
+
+	argc = parse_options(argc, argv, prefix, options, usage, 0);
+	if (argc != 1)
+		usage_with_options(usage, options);
+
+	path = argv[0];
+	if (prefix && *prefix && !is_absolute_path(path)) {
+		resolved_path = xstrfmt("%s%s", prefix, path);
+		path = resolved_path;
+	}
+
+	code = get_default_remote_submodule(path, &default_remote);
+	if (code) {
+		free(resolved_path);
+		return code;
+	}
+
+	printf("%s\n", default_remote);
+	free(default_remote);
+	free(resolved_path);
 	return 0;
 }
 
@@ -435,6 +474,102 @@ struct init_cb {
 };
 #define INIT_CB_INIT { 0 }
 
+static int validate_and_set_submodule_gitdir(struct strbuf *gitdir_path,
+					     const char *submodule_name)
+{
+	const char *value;
+	char *key;
+
+	if (validate_submodule_git_dir(gitdir_path->buf, submodule_name))
+		return -1;
+
+	key = xstrfmt("submodule.%s.gitdir", submodule_name);
+
+	/* Nothing to do if the config already exists. */
+	if (!repo_config_get_string_tmp(the_repository, key, &value)) {
+		free(key);
+		return 0;
+	}
+
+	if (repo_config_set_gently(the_repository, key, gitdir_path->buf)) {
+		free(key);
+		return -1;
+	}
+
+	free(key);
+	return 0;
+}
+
+static void create_default_gitdir_config(const char *submodule_name)
+{
+	struct strbuf gitdir_path = STRBUF_INIT;
+	struct git_hash_ctx ctx;
+	char hex_name_hash[GIT_MAX_HEXSZ + 1], header[128];
+	unsigned char raw_name_hash[GIT_MAX_RAWSZ];
+	int header_len;
+
+	/* Case 1: try the plain module name */
+	repo_git_path_append(the_repository, &gitdir_path, "modules/%s", submodule_name);
+	if (!validate_and_set_submodule_gitdir(&gitdir_path, submodule_name)) {
+		strbuf_release(&gitdir_path);
+		return;
+	}
+
+	/* Case 2.1: Try URI-safe (RFC3986) encoding first, this fixes nested gitdirs */
+	strbuf_reset(&gitdir_path);
+	repo_git_path_append(the_repository, &gitdir_path, "modules/");
+	strbuf_addstr_urlencode(&gitdir_path, submodule_name, is_rfc3986_unreserved);
+	if (!validate_and_set_submodule_gitdir(&gitdir_path, submodule_name)) {
+		strbuf_release(&gitdir_path);
+		return;
+	}
+
+	/* Case 2.2: Try extended uppercase URI (RFC3986) encoding, to fix case-folding */
+	strbuf_reset(&gitdir_path);
+	repo_git_path_append(the_repository, &gitdir_path, "modules/");
+	strbuf_addstr_urlencode(&gitdir_path, submodule_name, is_casefolding_rfc3986_unreserved);
+	if (!validate_and_set_submodule_gitdir(&gitdir_path, submodule_name))
+		return;
+
+	/* Case 2.3: Try some derived gitdir names, see if one sticks */
+	for (char c = '0'; c <= '9'; c++) {
+		strbuf_reset(&gitdir_path);
+		repo_git_path_append(the_repository, &gitdir_path, "modules/");
+		strbuf_addstr_urlencode(&gitdir_path, submodule_name, is_rfc3986_unreserved);
+		strbuf_addch(&gitdir_path, c);
+		if (!validate_and_set_submodule_gitdir(&gitdir_path, submodule_name))
+			return;
+
+		strbuf_reset(&gitdir_path);
+		repo_git_path_append(the_repository, &gitdir_path, "modules/");
+		strbuf_addstr_urlencode(&gitdir_path, submodule_name, is_casefolding_rfc3986_unreserved);
+		strbuf_addch(&gitdir_path, c);
+		if (!validate_and_set_submodule_gitdir(&gitdir_path, submodule_name))
+			return;
+	}
+
+	/* Case 2.4: If all the above failed, try a hash of the name as a last resort */
+	header_len = snprintf(header, sizeof(header), "blob %zu", strlen(submodule_name));
+	the_hash_algo->init_fn(&ctx);
+	the_hash_algo->update_fn(&ctx, header, header_len);
+	the_hash_algo->update_fn(&ctx, "\0", 1);
+	the_hash_algo->update_fn(&ctx, submodule_name, strlen(submodule_name));
+	the_hash_algo->final_fn(raw_name_hash, &ctx);
+	hash_to_hex_algop_r(hex_name_hash, raw_name_hash, the_hash_algo);
+	strbuf_reset(&gitdir_path);
+	repo_git_path_append(the_repository, &gitdir_path, "modules/%s", hex_name_hash);
+	if (!validate_and_set_submodule_gitdir(&gitdir_path, submodule_name)) {
+		strbuf_release(&gitdir_path);
+		return;
+	}
+
+	/* Case 3: nothing worked, error out */
+	die(_("failed to set a valid default config for 'submodule.%s.gitdir'. "
+	      "Please ensure it is set, for example by running something like: "
+	      "'git config submodule.%s.gitdir .git/modules/%s'"),
+	    submodule_name, submodule_name, submodule_name);
+}
+
 static void init_submodule(const char *path, const char *prefix,
 			   const char *super_prefix,
 			   unsigned int flags)
@@ -511,6 +646,10 @@ static void init_submodule(const char *path, const char *prefix,
 		if (repo_config_set_gently(the_repository, sb.buf, upd))
 			die(_("Failed to register update mode for submodule path '%s'"), displaypath);
 	}
+
+	if (the_repository->repository_format_submodule_path_cfg)
+		create_default_gitdir_config(sub->name);
+
 	strbuf_release(&sb);
 	free(displaypath);
 	free(url);
@@ -593,16 +732,12 @@ static void print_status(unsigned int flags, char state, const char *path,
 	printf("\n");
 }
 
-static int handle_submodule_head_ref(const char *refname UNUSED,
-				     const char *referent UNUSED,
-				     const struct object_id *oid,
-				     int flags UNUSED,
-				     void *cb_data)
+static int handle_submodule_head_ref(const struct reference *ref, void *cb_data)
 {
 	struct object_id *output = cb_data;
 
-	if (oid)
-		oidcpy(output, oid);
+	if (ref->oid)
+		oidcpy(output, ref->oid);
 
 	return 0;
 }
@@ -1063,7 +1198,7 @@ static void submodule_summary_callback(struct diff_queue_struct *q,
 
 		if (!S_ISGITLINK(p->one->mode) && !S_ISGITLINK(p->two->mode))
 			continue;
-		temp = (struct module_cb*)malloc(sizeof(struct module_cb));
+		temp = xmalloc(sizeof(*temp));
 		temp->mod_src = p->one->mode;
 		temp->mod_dst = p->two->mode;
 		temp->oid_src = p->one->oid;
@@ -1115,7 +1250,7 @@ static int compute_summary_module_list(struct object_id *head_oid,
 
 	if (!info->cached) {
 		if (diff_cmd == DIFF_INDEX)
-			setup_work_tree();
+			setup_work_tree(the_repository);
 		if (repo_read_index_preload(the_repository, &rev.diffopt.pathspec, 0) < 0) {
 			perror("repo_read_index_preload");
 			ret = -1;
@@ -1206,6 +1341,82 @@ static int module_summary(int argc, const char **argv, const char *prefix,
 	ret = compute_summary_module_list((diff_cmd == DIFF_INDEX) ? &head_oid : NULL,
 					  &info, diff_cmd);
 	return ret;
+}
+
+static int module_gitdir(int argc, const char **argv, const char *prefix UNUSED,
+			 struct repository *repo)
+{
+	struct strbuf gitdir = STRBUF_INIT;
+
+	if (argc != 2)
+		usage(_("git submodule--helper gitdir <name>"));
+
+	submodule_name_to_gitdir(&gitdir, repo, argv[1]);
+
+	printf("%s\n", gitdir.buf);
+
+	strbuf_release(&gitdir);
+	return 0;
+}
+
+static int module_migrate(int argc UNUSED, const char **argv UNUSED,
+			  const char *prefix UNUSED, struct repository *repo)
+{
+	struct strbuf module_dir = STRBUF_INIT;
+	DIR *dir;
+	struct dirent *de;
+	int repo_version = 0;
+
+	repo_git_path_append(repo, &module_dir, "modules/");
+
+	dir = opendir(module_dir.buf);
+	if (!dir)
+		die(_("could not open '%s'"), module_dir.buf);
+
+	while ((de = readdir(dir))) {
+		struct strbuf gitdir_path = STRBUF_INIT;
+		char *key;
+		const char *value;
+
+		if (is_dot_or_dotdot(de->d_name))
+			continue;
+
+		strbuf_addf(&gitdir_path, "%s/%s", module_dir.buf, de->d_name);
+		if (!is_git_directory(gitdir_path.buf)) {
+			strbuf_release(&gitdir_path);
+			continue;
+		}
+		strbuf_release(&gitdir_path);
+
+		key = xstrfmt("submodule.%s.gitdir", de->d_name);
+		if (!repo_config_get_string_tmp(repo, key, &value)) {
+			/* Already has a gitdir config, nothing to do. */
+			free(key);
+			continue;
+		}
+		free(key);
+
+		create_default_gitdir_config(de->d_name);
+	}
+
+	closedir(dir);
+	strbuf_release(&module_dir);
+
+	repo_config_get_int(the_repository, "core.repositoryformatversion", &repo_version);
+	if (repo_version == 0 &&
+	    repo_config_set_gently(repo, "core.repositoryformatversion", "1"))
+		die(_("could not set core.repositoryformatversion to 1.\n"
+		      "Please set it for migration to work, for example:\n"
+		      "git config core.repositoryformatversion 1"));
+
+	if (repo_config_set_gently(repo, "extensions.submodulePathConfig", "true"))
+		die(_("could not enable submodulePathConfig extension. It is required\n"
+		      "for migration to work. Please enable it in the root repo:\n"
+		      "git config extensions.submodulePathConfig true"));
+
+	repo->repository_format_submodule_path_cfg = 1;
+
+	return 0;
 }
 
 struct sync_cb {
@@ -1703,10 +1914,6 @@ static int clone_submodule(const struct module_clone_data *clone_data,
 		clone_data_path = to_free = xstrfmt("%s/%s", repo_get_work_tree(the_repository),
 						    clone_data->path);
 
-	if (validate_submodule_git_dir(sm_gitdir, clone_data->name) < 0)
-		die(_("refusing to create/use '%s' in another submodule's "
-		      "git dir"), sm_gitdir);
-
 	if (!file_exists(sm_gitdir)) {
 		if (clone_data->require_init && !stat(clone_data_path, &st) &&
 		    !is_empty_dir(clone_data_path))
@@ -1793,8 +2000,9 @@ static int clone_submodule(const struct module_clone_data *clone_data,
 		char *head = xstrfmt("%s/HEAD", sm_gitdir);
 		unlink(head);
 		free(head);
-		die(_("refusing to create/use '%s' in another submodule's "
-		      "git dir"), sm_gitdir);
+		die(_("refusing to create/use '%s' in another submodule's git dir. "
+		      "Enabling extensions.submodulePathConfig should fix this."),
+		    sm_gitdir);
 	}
 
 	connect_work_tree_and_git_dir(clone_data_path, sm_gitdir, 0);
@@ -1907,6 +2115,13 @@ static int determine_submodule_update_strategy(struct repository *r,
 	const char *val;
 	int ret;
 
+	/*
+	 * NEEDSWORK: audit and ensure that update_submodule() has right
+	 * to assume that submodule_from_path() above will always succeed.
+	 */
+	if (!sub)
+		BUG("update_submodule assumes a submodule exists at path (%s)",
+		    path);
 	key = xstrfmt("submodule.%s.update", sub->name);
 
 	if (update) {
@@ -3123,9 +3338,10 @@ static int module_create_branch(int argc, const char **argv, const char *prefix,
 		N_("git submodule--helper create-branch [-f|--force] [--create-reflog] [-q|--quiet] [-t|--track] [-n|--dry-run] <name> <start-oid> <start-name>"),
 		NULL
 	};
+	struct repo_config_values *cfg = repo_config_values(the_repository);
 
 	repo_config(the_repository, git_default_config, NULL);
-	track = git_branch_track;
+	track = cfg->branch_track;
 	argc = parse_options(argc, argv, prefix, options, usage, 0);
 
 	if (argc != 3)
@@ -3187,13 +3403,13 @@ static void append_fetch_remotes(struct strbuf *msg, const char *git_dir_path)
 
 static int add_submodule(const struct add_data *add_data)
 {
-	char *submod_gitdir_path;
 	struct module_clone_data clone_data = MODULE_CLONE_DATA_INIT;
 	struct string_list reference = STRING_LIST_INIT_NODUP;
 	int ret = -1;
 
 	/* perhaps the path already exists and is already a git repo, else clone it */
 	if (is_directory(add_data->sm_path)) {
+		char *submod_gitdir_path;
 		struct strbuf sm_path = STRBUF_INIT;
 		strbuf_addstr(&sm_path, add_data->sm_path);
 		submod_gitdir_path = xstrfmt("%s/.git", add_data->sm_path);
@@ -3207,10 +3423,11 @@ static int add_submodule(const struct add_data *add_data)
 		free(submod_gitdir_path);
 	} else {
 		struct child_process cp = CHILD_PROCESS_INIT;
+		struct strbuf submod_gitdir = STRBUF_INIT;
 
-		submod_gitdir_path = xstrfmt(".git/modules/%s", add_data->sm_name);
+		submodule_name_to_gitdir(&submod_gitdir, the_repository, add_data->sm_name);
 
-		if (is_directory(submod_gitdir_path)) {
+		if (is_directory(submod_gitdir.buf)) {
 			if (!add_data->force) {
 				struct strbuf msg = STRBUF_INIT;
 				char *die_msg;
@@ -3219,8 +3436,8 @@ static int add_submodule(const struct add_data *add_data)
 						    "locally with remote(s):\n"),
 					    add_data->sm_name);
 
-				append_fetch_remotes(&msg, submod_gitdir_path);
-				free(submod_gitdir_path);
+				append_fetch_remotes(&msg, submod_gitdir.buf);
+				strbuf_release(&submod_gitdir);
 
 				strbuf_addf(&msg, _("If you want to reuse this local git "
 						    "directory instead of cloning again from\n"
@@ -3238,7 +3455,7 @@ static int add_submodule(const struct add_data *add_data)
 					 "submodule '%s'\n"), add_data->sm_name);
 			}
 		}
-		free(submod_gitdir_path);
+		strbuf_release(&submod_gitdir);
 
 		clone_data.prefix = add_data->prefix;
 		clone_data.path = add_data->sm_path;
@@ -3531,14 +3748,15 @@ static int module_add(int argc, const char **argv, const char *prefix,
 		}
 	}
 
-	if(!add_data.sm_name)
+	if (!add_data.sm_name)
 		add_data.sm_name = add_data.sm_path;
 
 	existing = submodule_from_name(the_repository,
 					null_oid(the_hash_algo),
 					add_data.sm_name);
 
-	if (existing && strcmp(existing->path, add_data.sm_path)) {
+	if (existing && existing->path &&
+	    strcmp(existing->path, add_data.sm_path)) {
 		if (!force) {
 			die(_("submodule name '%s' already used for path '%s'"),
 			    add_data.sm_name, existing->path);
@@ -3565,6 +3783,9 @@ static int module_add(int argc, const char **argv, const char *prefix,
 	add_data.progress = !!progress;
 	add_data.dissociate = !!dissociate;
 
+	if (the_repository->repository_format_submodule_path_cfg)
+		create_default_gitdir_config(add_data.sm_name);
+
 	if (add_submodule(&add_data))
 		goto cleanup;
 	configure_added_submodule(&add_data);
@@ -3590,6 +3811,8 @@ int cmd_submodule__helper(int argc,
 		NULL
 	};
 	struct option options[] = {
+		OPT_SUBCOMMAND("migrate-gitdir-configs", &fn, module_migrate),
+		OPT_SUBCOMMAND("gitdir", &fn, module_gitdir),
 		OPT_SUBCOMMAND("clone", &fn, module_clone),
 		OPT_SUBCOMMAND("add", &fn, module_add),
 		OPT_SUBCOMMAND("update", &fn, module_update),
@@ -3604,6 +3827,7 @@ int cmd_submodule__helper(int argc,
 		OPT_SUBCOMMAND("set-url", &fn, module_set_url),
 		OPT_SUBCOMMAND("set-branch", &fn, module_set_branch),
 		OPT_SUBCOMMAND("create-branch", &fn, module_create_branch),
+		OPT_SUBCOMMAND("get-default-remote", &fn, module_get_default_remote),
 		OPT_END()
 	};
 	argc = parse_options(argc, argv, prefix, options, usage, 0);

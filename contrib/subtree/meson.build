@@ -3,7 +3,7 @@ git_subtree = custom_target(
   output: 'git-subtree',
   command: [
     shell,
-    meson.project_source_root() / 'generate-script.sh',
+    meson.project_source_root() / 'tools/generate-script.sh',
     '@INPUT@',
     '@OUTPUT@',
     meson.project_build_root() / 'GIT-BUILD-OPTIONS',
@@ -68,6 +68,6 @@ if get_option('docs').contains('html')
     input: 'git-subtree.adoc',
     output: 'git-subtree.html',
     install: true,
-    install_dir: get_option('datadir') / 'doc/git-doc',
+    install_dir: htmldir,
   )
 endif
