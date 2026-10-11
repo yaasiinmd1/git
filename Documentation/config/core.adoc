@@ -118,6 +118,13 @@ core.trustctime::
 	crawlers and some backup systems).
 	See linkgit:git-update-index[1]. True by default.
 
+core.useNanosec::
+	If true, use nanosecond precision for ctime and mtime
+	comparisons between the index and the working tree (if Git
+	was compiled to respect this option).
+	This is unsafe on some platforms;
+	see link:technical/racy-git.html[Racy Git]. False by default.
+
 core.splitIndex::
 	If true, the split-index feature of the index will be used.
 	See linkgit:git-update-index[1]. False by default.
@@ -588,6 +595,14 @@ core.packedRefsTimeout::
 	lock the `packed-refs` file. Value 0 means not to retry at
 	all; -1 means to try indefinitely. Default is 1000 (i.e.,
 	retry for 1 second).
+
+core.configLockTimeout::
+	The length of time, in milliseconds, to retry when trying to
+	lock a configuration file for writing. Value 0 means not to
+	retry at all; -1 means to try indefinitely. Default is 1000
+	(i.e., retry for 1 second). This is read from the configuration
+	that is already on disk before the lock is taken, so it can be
+	set persistently like any other option.
 
 core.pager::
 	Text viewer for use by Git commands (e.g., 'less').  The value

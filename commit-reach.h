@@ -73,7 +73,8 @@ int ref_newer(const struct object_id *new_oid, const struct object_id *old_oid);
 enum contains_result {
 	CONTAINS_UNKNOWN = 0,
 	CONTAINS_NO,
-	CONTAINS_YES
+	CONTAINS_YES,
+	CONTAINS_IN_PROGRESS
 };
 
 define_commit_slab(contains_cache, enum contains_result);
@@ -88,13 +89,14 @@ int commit_contains(struct ref_filter *filter, struct commit *commit,
  * commits with date below 'min_commit_date' or generation below
  * 'min_generation'.
  */
-int can_all_from_reach_with_flag(struct object_array *from,
+int can_all_from_reach_with_flag(struct repository *r,
+				 struct object_array *from,
 				 unsigned int with_flag,
 				 unsigned int assign_flag,
 				 timestamp_t min_commit_date,
 				 timestamp_t min_generation);
-int can_all_from_reach(struct commit_list *from, struct commit_list *to,
-		       int commit_date_cutoff);
+int can_all_from_reach(struct repository *r, struct commit_list *from,
+		       struct commit_list *to, int commit_date_cutoff);
 
 
 /*

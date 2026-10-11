@@ -210,7 +210,7 @@ parse_option () {
 	-i|--i|--im|--imm|--imme|--immed|--immedi|--immedia|--immediat|--immediate)
 		immediate=t ;;
 	-l|--l|--lo|--lon|--long|--long-|--long-t|--long-te|--long-tes|--long-test|--long-tests)
-		GIT_TEST_LONG=t; export GIT_TEST_LONG ;;
+		GIT_TEST_LONG=true; export GIT_TEST_LONG ;;
 	-r)
 		mark_option_requires_arg "$opt" run_list
 		;;
@@ -575,8 +575,8 @@ export EDITOR
 GIT_TEST_BUILTIN_HASH=$("$GIT_BINARY" version --build-options | sed -ne 's/^default-hash: //p')
 GIT_DEFAULT_HASH="${GIT_TEST_DEFAULT_HASH:-$GIT_TEST_BUILTIN_HASH}"
 export GIT_DEFAULT_HASH
-GIT_DEFAULT_REF_FORMAT="${GIT_TEST_DEFAULT_REF_FORMAT:-files}"
-export GIT_DEFAULT_REF_FORMAT
+GIT_DEFAULT_REF_STORAGE_FORMAT="${GIT_TEST_DEFAULT_REF_STORAGE_FORMAT:-files}"
+export GIT_DEFAULT_REF_STORAGE_FORMAT
 
 # Tests using GIT_TRACE typically don't want <timestamp> <file>:<line> output
 GIT_TRACE_BARE=1
@@ -1217,14 +1217,14 @@ check_test_results_san_file_ () {
 	then
 		return
 	fi &&
-	say_color error "$(cat "$TEST_RESULTS_SAN_FILE".*)" &&
+	say_color >&4 error "$(cat "$TEST_RESULTS_SAN_FILE".*)" &&
 
 	if test "$test_failure" = 0
 	then
-		say "Our logs revealed a memory leak, exit non-zero!" &&
+		say >&4 "Our logs revealed a memory leak, exit non-zero!" &&
 		invert_exit_code=t
 	else
-		say "Our logs revealed a memory leak..."
+		say >&4 "Our logs revealed a memory leak..."
 	fi
 }
 
@@ -1752,13 +1752,13 @@ parisc* | hppa*)
 	;;
 esac
 
-case "$GIT_DEFAULT_REF_FORMAT" in
+case "$GIT_DEFAULT_REF_STORAGE_FORMAT" in
 files)
 	test_set_prereq REFFILES;;
 reftable)
 	test_set_prereq REFTABLE;;
 *)
-	echo 2>&1 "error: unknown ref format $GIT_DEFAULT_REF_FORMAT"
+	echo 2>&1 "error: unknown ref storage format $GIT_DEFAULT_REF_STORAGE_FORMAT"
 	exit 1
 	;;
 esac
@@ -1849,7 +1849,7 @@ test_lazy_prereq AUTOIDENT '
 '
 
 test_lazy_prereq EXPENSIVE '
-	test -n "$GIT_TEST_LONG"
+	test_bool_env GIT_TEST_LONG false
 '
 
 test_lazy_prereq EXPENSIVE_ON_WINDOWS '

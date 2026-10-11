@@ -363,8 +363,8 @@ raise an error.
 	Keep unreachable objects in loose form. This implies `--revs`.
 
 --delta-islands::
-	Restrict delta matches based on "islands". See DELTA ISLANDS
-	below.
+	Restrict delta matches based on "islands".
+	See <<DELTA_ISLANDS,DELTA ISLANDS>> below.
 
 --name-hash-version=<n>::
 	While performing delta compression, Git groups objects that may be
@@ -402,13 +402,16 @@ will be automatically changed to version `1`.
 	of filenames that cause collisions in Git's default name-hash
 	algorithm.
 +
-Incompatible with `--delta-islands`. The `--use-bitmap-index` option is
-ignored in the presence of `--path-walk`. The `--path-walk` option
-supports the `--filter=<spec>` forms `blob:none`, `blob:limit=<n>`,
-`tree:0`, `object:type=<type>`, and `sparse:<oid>`. These supported filter
-types can be combined with the `combine:<spec>+<spec>` form.
+When `--use-bitmap-index` is specified with `--path-walk`, a successful
+bitmap traversal is used for object enumeration, with path-walk
+remaining as the fallback traversal when the bitmap cannot satisfy the
+request. The `--path-walk` option supports the `--filter=<spec>` forms
+`blob:none`, `blob:limit=<n>`, `tree:0`, `object:type=<type>`, and
+`sparse:<oid>`. These supported filter types can be combined with the
+`combine:<spec>+<spec>` form.
 
 
+[[DELTA_ISLANDS]]
 DELTA ISLANDS
 -------------
 

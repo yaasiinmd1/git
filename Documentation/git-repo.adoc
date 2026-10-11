@@ -22,8 +22,8 @@ COMMANDS
 --------
 `info [--format=(lines|nul) | -z] [--all | <key>...]`::
 	Retrieve metadata-related information about the current repository. Only
-	the requested data will be returned based on their keys (see "INFO KEYS"
-	section below).
+	the requested data will be returned based on their keys
+	(see <<INFO_KEYS,"INFO KEYS">> section below).
 +
 The values are returned in the same order in which their respective keys were
 requested. The `--all` flag requests the values for all the available keys.
@@ -89,6 +89,7 @@ supported:
 +
 `-z` is an alias for `--format=nul`.
 
+[[INFO_KEYS]]
 INFO KEYS
 ---------
 In order to obtain a set of values from `git repo info`, you should provide
@@ -103,6 +104,21 @@ values that they return:
 
 `object.format`::
 	The object format (hash algorithm) used in the repository.
+
+`path.commondir.absolute`::
+	The canonical absolute path to the Git repository's common
+	directory (the shared `.git` directory containing objects,
+	refs, and global configuration).
+
+`path.commondir.relative`::
+	The path to the Git repository's common directory relative to
+	the current working directory.
+
+`path.gitdir.absolute`::
+	The canonical absolute path to the Git repository directory (the `.git` directory).
+
+`path.gitdir.relative`::
+	The path to the Git repository directory relative to the current working directory.
 
 `references.format`::
 	The reference storage format. The valid values are:
